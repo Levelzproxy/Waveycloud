@@ -1,0 +1,140 @@
+# Cloud Android phone on GitHub Actions (redroid edition).
+#
+# Needs: a PUBLIC repo, this file at .github/workflows/cloud-phone.yml,
+# then Actions -> cloud-phone -> Run workflow. No APK upload required.
+#
+# Why redroid instead of an emulator: GitHub's x86_64 Ubuntu runners already
+# ship the binder_linux and ashmem_linux kernel modules and allow privileged
+# Docker, so Android can boot as a container without KVM tricks.
+#
+# WHAT YOU GET: an Android screen in a browser tab, ~10 min after you hit Run,
+# for up to ~5 hours, with Roblox installed on it.
+#
+# LIMITS, STATED ONCE: 6h cap, wiped after each run, and this is general-purpose
+# compute on a CI service (GitHub's Additional Product Terms restrict hosted
+# runners to work on the repo). Roblox will still treat it as not-a-phone when
+# you try to join a public game.
+
+name: cloud-phone
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Optional direct APK/XAPK URL (leave empty to auto-download Roblox)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Android kernel modules + adb
+        run: |
+          getconf PAGESIZE
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq linux-modules-extra-$(uname -r) adb unzip curl
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binder /dev/binderfs || true
+          echo "--- binderfs ---"
+          ls -l /dev/binderfs || true
+
+      - name: Fetch Roblox
+        run: |
+          set -u
+          mkdir -p apk
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
+
+          if [ -n "${{ github.event.inputs.apk_url }}" ]; then
+            curl -fL --retry 2 -A "$UA" -o apk/roblox.bin "${{ github.event.inputs.apk_url }}" || true
+          fi
+
+          if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
+            for u in \
+              "https://d.apkpure.com/b/XAPK/com.roblox.client?version=latest" \
+              "https://d.apkpure.com/b/APK/com.roblox.client?version=latest"
+            do
+              echo "trying $u"
+              curl -fL --retry 2 --max-time 420 -A "$UA" -o apk/roblox.bin "$u" || true
+              if [ -f apk/roblox.bin ] && [ "$(stat -c%s apk/roblox.bin)" -gt 5000000 ]; then
+                echo "got $(stat -c%s apk/roblox.bin) bytes"
+                break
+              fi
+              rm -f apk/roblox.bin
+            done
+          fi
+
+          ls -lh apk/ || true
+          FILE=$(find apk -maxdepth 1 -type f -printf '%s\t%p\n' | sort -rn | head -n1 | cut -f2-)
+          echo "APK_FILE=$FILE" >> "$GITHUB_ENV"
+          echo "using: $FILE"
+
+      - name: Start redroid
+        run: |
+          sudo service docker start || true
+          docker info >/dev/null
+          mkdir -p "$HOME/data"
+          docker run -d --privileged --name redroid \
+            -v "$HOME/data:/data" \
+            -p 127.0.0.1:5555:5555 \
+            redroid/redroid:12.0.0_64only-latest \
+            androidboot.redroid_width=540 \
+            androidboot.redroid_height=960 \
+            androidboot.redroid_dpi=240 \
+            androidboot.redroid_fps=30 \
+            androidboot.redroid_gpu_mode=guest \
+            androidboot.redroid_vm_heap=256m \
+            androidboot.use_memfd=1
+          sleep 5
+          docker logs redroid | tail -n 30 || true
+          for i in $(seq 1 60); do
+            adb connect localhost:5555 >/dev/null 2>&1 || true
+            if adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | grep -q 1; then
+              echo "booted after $((i*5))s"
+              break
+            fi
+            sleep 5
+          done
+          adb devices
+
+      - name: Install and stream
+        run: |
+          set -x
+          if [ -n "${APK_FILE:-}" ] && [ -f "$APK_FILE" ]; then
+            if unzip -l "$APK_FILE" 2>/dev/null | grep -q 'AndroidManifest.xml'; then
+              adb -s localhost:5555 install -r -g "$APK_FILE" || echo "INSTALL FAILED - need universal/x86_64"
+            else
+              rm -rf split && mkdir -p split
+              unzip -o -q "$APK_FILE" -d split
+              find split -name '*.apk'
+              # redroid here is x86_64: drop ARM splits or the install refuses
+              FILES=$(find split -name '*.apk' | grep -vE 'armeabi|arm64' | tr '\n' ' ')
+              adb -s localhost:5555 install-multiple -r -g $FILES || \
+                adb -s localhost:5555 install-multiple -r -g $(find split -name '*.apk')
+            fi
+          fi
+          adb -s localhost:5555 shell pm list packages | grep -i roblox || true
+
+          git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git client
+          cd client && npm install --no-audit --no-fund && npm run build || true
+          cd ..
+          nohup npm --prefix client start > /tmp/ws.log 2>&1 &
+          sleep 25
+
+          curl -fL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          sleep 20
+          echo "=============================================="
+          grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n 1
+          echo "=============================================="
+
+          sleep 16000
