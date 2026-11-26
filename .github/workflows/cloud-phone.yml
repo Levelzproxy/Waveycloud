@@ -37,14 +37,31 @@ jobs:
 
       - name: Android kernel modules + adb
         run: |
-          getconf PAGESIZE
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq linux-modules-extra-$(uname -r) adb unzip curl
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          set +e
+          echo "kernel: $(uname -r)"
+          echo "pages:  $(getconf PAGESIZE)"
+
+          # Runner images already ship binder_linux on x86_64. Only reach for apt
+          # if modprobe fails: the Azure kernel often has no matching
+          # linux-modules-extra package, and bash -e turns that into a 4s failure.
+          if ! sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"; then
+            echo "binder not loaded, trying package"
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" \
+              || sudo apt-get install -y -qq linux-modules-extra-azure \
+              || true
+            sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          fi
+
+          command -v adb >/dev/null || sudo apt-get install -y -qq adb
+          command -v unzip >/dev/null || sudo apt-get install -y -qq unzip
+          command -v curl >/dev/null || sudo apt-get install -y -qq curl
+
           sudo mkdir -p /dev/binderfs
-          sudo mount -t binder binder /dev/binderfs || true
+          sudo mount -t binder binder /dev/binderfs || sudo mount -t binder none /dev/binderfs || true
           echo "--- binderfs ---"
-          ls -l /dev/binderfs || true
+          ls -l /dev/binderfs
+          grep -i binder /proc/filesystems
 
       - name: Fetch Roblox
         run: |
