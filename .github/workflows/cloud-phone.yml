@@ -79,13 +79,29 @@ jobs:
               "https://d.apkpure.com/b/APK/com.roblox.client?version=latest"
             do
               echo "trying $u"
-              curl -fL --retry 2 --max-time 420 -A "$UA" -o apk/roblox.bin "$u" || true
-              if [ -f apk/roblox.bin ] && [ "$(stat -c%s apk/roblox.bin)" -gt 5000000 ]; then
-                echo "got $(stat -c%s apk/roblox.bin) bytes"
+              code=$(curl -L --retry 3 --max-time 420 --compressed \
+                -H "User-Agent: $UA" \
+                -H "Accept: */*" \
+                -H "Referer: https://apkpure.com/" \
+                -o apk/roblox.bin -w '%{http_code}' "$u" || echo 000)
+              echo "http=$code size=$(stat -c%s apk/roblox.bin 2>/dev/null || echo 0)"
+              if [ "$code" = "200" ] && [ "$(stat -c%s apk/roblox.bin 2>/dev/null || echo 0)" -gt 5000000 ]; then
                 break
               fi
               rm -f apk/roblox.bin
             done
+          fi
+
+          # Last resort: apkeep speaks APKPure's Cloudflare dance properly.
+          if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
+            echo "APKPure blocked plain curl, trying apkeep"
+            mkdir -p ak
+            gh release download --repo EFForg/apkeep --pattern '*x86_64*linux*' --dir ak 2>/dev/null || true
+            AK=$(find ak -type f -name 'apkeep*' | head -n1)
+            if [ -n "$AK" ]; then
+              chmod +x "$AK"
+              "$AK" -a com.roblox.client -d apk-pure apk 2>&1 | tail -n 20 || true
+            fi
           fi
 
           ls -lh apk/ || true
@@ -137,7 +153,12 @@ jobs:
                 adb -s localhost:5555 install-multiple -r -g $(find split -name '*.apk')
             fi
           fi
-          adb -s localhost:5555 shell pm list packages | grep -i roblox || true
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -qi 'package:com.roblox.client'; then
+            echo "ROBLOX INSTALLED OK"
+            adb -s localhost:5555 shell monkey -p com.roblox.client -c android.intent.category.LAUNCHER 1 || true
+          else
+            echo "ROBLOX_NOT_INSTALLED - the download or the install failed, see the lines above"
+          fi
 
           git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git client
           cd client && npm install --no-audit --no-fund && npm run build || true
