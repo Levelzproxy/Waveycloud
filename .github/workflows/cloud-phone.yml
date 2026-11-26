@@ -24,6 +24,10 @@ on:
         description: "Optional direct APK/XAPK URL (leave empty to auto-download Roblox)"
         required: false
         default: ""
+      android:
+        description: "Android version: 13 (newest tested), 12, or 11 (fastest on a GPU-less box)"
+        required: false
+        default: "13"
 
 permissions:
   contents: read
@@ -113,17 +117,31 @@ jobs:
         run: |
           sudo service docker start || true
           docker info >/dev/null
+
+          # Newer Android = newer device, but it is CPU-rendered either way
+          # (no GPU on a hosted runner), so 11 is the "make it fast" knob.
+          ANDROID="${{ github.event.inputs.android }}"
+          ANDROID="${ANDROID:-13}"
+          case "$ANDROID" in
+            11) IMG="redroid/redroid:11.0.0-latest" ;;
+            *)  IMG="redroid/redroid:${ANDROID}.0.0_64only-latest" ;;
+          esac
+          echo "image: $IMG"
+
           mkdir -p "$HOME/data"
+          # Every pixel is CPU work under SwiftShader, so 480x854 instead of
+          # 540x960; --cpus 3 leaves one core for the H.264 encoder + tunnel.
           docker run -d --privileged --name redroid \
+            --memory 8g --cpus 3 \
             -v "$HOME/data:/data" \
             -p 127.0.0.1:5555:5555 \
-            redroid/redroid:12.0.0_64only-latest \
-            androidboot.redroid_width=540 \
-            androidboot.redroid_height=960 \
-            androidboot.redroid_dpi=240 \
+            "$IMG" \
+            androidboot.redroid_width=480 \
+            androidboot.redroid_height=854 \
+            androidboot.redroid_dpi=200 \
             androidboot.redroid_fps=30 \
             androidboot.redroid_gpu_mode=guest \
-            androidboot.redroid_vm_heap=256m \
+            androidboot.redroid_vm_heap=512m \
             androidboot.use_memfd=1
           sleep 5
           docker logs redroid | tail -n 30 || true
@@ -136,6 +154,12 @@ jobs:
             sleep 5
           done
           adb devices
+
+          # Animations are pure lag on a software renderer: turn them off.
+          for k in window_animation_scale transition_animation_scale animator_duration_scale; do
+            adb -s localhost:5555 shell settings put global "$k" 0 || true
+          done
+          adb -s localhost:5555 shell svc power stayon true || true
 
       - name: Install and stream
         run: |
@@ -163,6 +187,14 @@ jobs:
           fi
 
           git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git client
+          # ws-scrcpy defaults to 60 fps / 7 Mbps / 720px. That is the main
+          # source of the lag, not the Android version: cap it to 30 fps / 3 Mbps
+          # at the device's native 480x854.
+          perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: 3145728, maxFps: 30, iFrameInterval: 10, bounds: new Size(854, 854), sendFrameMeta: false });/s' \
+            client/src/app/player/MsePlayer.ts
+          grep -q 'bitrate: 3145728' client/src/app/player/MsePlayer.ts \
+            && echo "STREAM TUNED: 30fps / 3Mbps / native size" \
+            || echo "STREAM TUNE MISSED - using ws-scrcpy defaults"
           cd client && npm install --no-audit --no-fund && npm run build || true
           cd ..
           nohup npm --prefix client start > /tmp/ws.log 2>&1 &
@@ -171,7 +203,9 @@ jobs:
           curl -fL -o cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
           chmod +x cloudflared
-          nohup ./cloudflared tunnel --url http://localhost:8000 --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          # http2 = plain TCP 443. School/guest wifi often blocks the UDP that
+          # cloudflared's default QUIC transport needs, which shows up as stutter.
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 --no-autoupdate > /tmp/tunnel.log 2>&1 &
           sleep 20
           echo "=============================================="
           grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n 1
