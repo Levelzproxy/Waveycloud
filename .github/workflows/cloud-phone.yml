@@ -70,7 +70,7 @@ jobs:
           UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
 
           if [ -n "${{ github.event.inputs.apk_url }}" ]; then
-            curl -fL --retry 2 -A "$UA" -o apk/roblox.bin "${{ github.event.inputs.apk_url }}" || true
+            curl -fL --retry 2 -A "$UA" -o apk/roblox.apk "${{ github.event.inputs.apk_url }}" || true
           fi
 
           if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
@@ -83,12 +83,12 @@ jobs:
                 -H "User-Agent: $UA" \
                 -H "Accept: */*" \
                 -H "Referer: https://apkpure.com/" \
-                -o apk/roblox.bin -w '%{http_code}' "$u" || echo 000)
-              echo "http=$code size=$(stat -c%s apk/roblox.bin 2>/dev/null || echo 0)"
-              if [ "$code" = "200" ] && [ "$(stat -c%s apk/roblox.bin 2>/dev/null || echo 0)" -gt 5000000 ]; then
+                -o apk/roblox.apk -w '%{http_code}' "$u" || echo 000)
+              echo "http=$code size=$(stat -c%s apk/roblox.apk 2>/dev/null || echo 0)"
+              if [ "$code" = "200" ] && [ "$(stat -c%s apk/roblox.apk 2>/dev/null || echo 0)" -gt 5000000 ]; then
                 break
               fi
-              rm -f apk/roblox.bin
+              rm -f apk/roblox.apk
             done
           fi
 
@@ -141,8 +141,10 @@ jobs:
         run: |
           set -x
           if [ -n "${APK_FILE:-}" ] && [ -f "$APK_FILE" ]; then
-            if unzip -l "$APK_FILE" 2>/dev/null | grep -q 'AndroidManifest.xml'; then
-              adb -s localhost:5555 install -r -g "$APK_FILE" || echo "INSTALL FAILED - need universal/x86_64"
+            # adb refuses anything not ending .apk, whatever the file really is.
+            cp "$APK_FILE" /tmp/install.apk
+            if unzip -l /tmp/install.apk 2>/dev/null | grep -q 'AndroidManifest.xml'; then
+              adb -s localhost:5555 install -r -g /tmp/install.apk || echo "INSTALL FAILED - need universal/x86_64"
             else
               rm -rf split && mkdir -p split
               unzip -o -q "$APK_FILE" -d split
