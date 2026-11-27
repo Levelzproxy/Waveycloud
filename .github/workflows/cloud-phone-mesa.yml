@@ -1,0 +1,295 @@
+# Cloud Android phone, GPU-less, MESA edition.
+#
+# Same job as cloud-phone.yml, but instead of redroid this boots a real Android
+# emulator with Mesa's llvmpipe/lavapipe as the software renderer. On the same
+# hardware that is roughly 1.5-2.5x faster than redroid's SwiftShader, because
+# llvmpipe JIT-compiles shaders and spreads rasterisation over every core.
+#
+# Needs: a PUBLIC repo, this file at .github/workflows/cloud-phone-mesa.yml,
+# then Actions -> cloud-phone-mesa -> Run workflow.
+#
+# WHAT YOU GET: an Android screen in a browser tab ~10-15 min after Run, for up
+# to ~5 hours, Roblox installed at its cheapest graphics preset.
+#
+# KEYBOARD: this emulator image declares a hardware keyboard (hw.keyboard=yes),
+# so Roblox turns its keyboard controls on and ws-scrcpy's normal key injection
+# drives WASD directly -- no touch bridge needed on this path.
+#
+# LIMITS, STATED ONCE: 6h cap, wiped after each run, and this is general-purpose
+# compute on a CI service (GitHub's Additional Product Terms restrict hosted
+# runners to work on the repo). Roblox still treats it as not-a-phone when you
+# try to join a public game without edit rights.
+
+name: cloud-phone-mesa
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_level:
+        description: "Android API level to boot"
+        required: false
+        default: "33"
+      gpu_mode:
+        description: "Emulator renderer: lavapipe (Mesa, default), software, swiftshader"
+        required: false
+        default: "lavapipe"
+      force_vulkan:
+        description: "Make Roblox use Vulkan instead of OpenGL ES (try if lavapipe looks slow)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: KVM + Android SDK
+        run: |
+          set -x
+          ls -l /dev/kvm || true
+          if [ -e /dev/kvm ]; then echo "KVM: present"; else echo "KVM: MISSING - the emulator will crawl"; fi
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+
+          SDK="${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}"
+          [ -d "$SDK" ] || SDK="$HOME/android-sdk"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          AV="$SDK/cmdline-tools/latest/bin/avdmanager"
+          [ -x "$SM" ] || SM=$(command -v sdkmanager)
+          [ -x "$AV" ] || AV=$(command -v avdmanager)
+          echo "SDK=$SDK" >> "$GITHUB_ENV"
+          echo "SM=$SM" >> "$GITHUB_ENV"
+          echo "AV=$AV" >> "$GITHUB_ENV"
+
+          # Mesa's software Vulkan driver, in case the bundled copy is missing.
+          sudo apt-get install -y -qq mesa-vulkan-drivers libvulkan1 > /dev/null 2>&1 || true
+
+          timeout 180 bash -c "yes | '$SM' --licenses" > /dev/null 2>&1 || true
+          "$SM" "platform-tools" "emulator" "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" > /tmp/sdk.log 2>&1
+          echo "sdkmanager exit: $?"
+          tail -n 6 /tmp/sdk.log
+
+          echo "$SDK/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK/emulator" >> "$GITHUB_PATH"
+          "$SDK/platform-tools/adb" version | head -n 1 || true
+
+      - name: Create AVD (640x360, hardware keyboard)
+        run: |
+          set -x
+          echo no | "$AV" create avd -n mesa \
+            -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" --force
+          CFG="$HOME/.android/avd/mesa.avd/config.ini"
+          printf '%s\n' \
+            'hw.lcd.width=640' \
+            'hw.lcd.height=360' \
+            'hw.lcd.density=160' \
+            'hw.keyboard=yes' \
+            'hw.mainKeys=no' \
+            'hw.ramSize=4096' \
+            'disk.dataPartition.size=6G' >> "$CFG"
+          grep -E 'hw.lcd|hw.keyboard|hw.ramSize' "$CFG" || true
+
+      - name: Boot emulator
+        run: |
+          set -x
+          GPU="${{ github.event.inputs.gpu_mode }}"
+          nohup "$SDK/emulator/emulator" -avd mesa -no-window -no-audio -no-boot-anim \
+            -no-snapshot -gpu "$GPU" -accel on -cores 4 -memory 4096 > /tmp/emu.log 2>&1 &
+          EMU_PID=$!
+          sleep 25
+          # Older emulator builds do not know every -gpu mode; retry rather than
+          # spinning for 7 minutes on a process that already exited.
+          if ! kill -0 "$EMU_PID" 2>/dev/null; then
+            echo "emulator exited with -gpu $GPU (log below), retrying with -gpu software"
+            tail -n 20 /tmp/emu.log
+            nohup "$SDK/emulator/emulator" -avd mesa -no-window -no-audio -no-boot-anim \
+              -no-snapshot -gpu software -accel on -cores 4 -memory 4096 > /tmp/emu.log 2>&1 &
+            sleep 25
+          fi
+          adb start-server
+          adb devices
+          for i in $(seq 1 90); do
+            if [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = "1" ]; then
+              echo "booted after $((i*5))s"
+              break
+            fi
+            sleep 5
+          done
+          adb shell input keyevent 82 || true
+
+          # Animations are pure lag on a software renderer.
+          for k in window_animation_scale transition_animation_scale animator_duration_scale; do
+            adb shell settings put global "$k" 0 || true
+          done
+          adb shell svc power stayon true || true
+          adb shell setprop debug.sf.latch_unsignaled 1 || true
+
+          echo "display: $(adb shell wm size | tr -d '\r')"
+          echo "--- which renderer is actually in use ---"
+          adb shell getprop ro.hardware.egl || true
+          adb shell getprop ro.opengles.version || true
+          adb shell dumpsys SurfaceFlinger 2>/dev/null | grep -m2 -i 'GLES' || true
+          echo "--- emulator log ---"
+          tail -n 25 /tmp/emu.log
+
+      - name: Fetch Roblox
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          mkdir -p apk
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
+
+          if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
+            for u in \
+              "https://d.apkpure.com/b/XAPK/com.roblox.client?version=latest" \
+              "https://d.apkpure.com/b/APK/com.roblox.client?version=latest"
+            do
+              echo "trying $u"
+              code=$(curl -L --retry 3 --max-time 420 --compressed \
+                -H "User-Agent: $UA" \
+                -H "Accept: */*" \
+                -H "Referer: https://apkpure.com/" \
+                -o apk/roblox.apk -w '%{http_code}' "$u" || echo 000)
+              echo "http=$code size=$(stat -c%s apk/roblox.apk 2>/dev/null || echo 0)"
+              if [ "$code" = "200" ] && [ "$(stat -c%s apk/roblox.apk 2>/dev/null || echo 0)" -gt 5000000 ]; then
+                break
+              fi
+              rm -f apk/roblox.apk
+            done
+          fi
+
+          # Last resort: apkeep speaks APKPure's Cloudflare dance properly.
+          if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
+            echo "APKPure blocked plain curl, trying apkeep"
+            mkdir -p ak
+            gh release download --repo EFForg/apkeep --pattern '*x86_64*linux*' --dir ak 2>/dev/null || true
+            AK=$(find ak -type f -name 'apkeep*' | head -n1)
+            if [ -n "$AK" ]; then
+              chmod +x "$AK"
+              "$AK" -a com.roblox.client -d apk-pure apk 2>&1 | tail -n 20 || true
+            fi
+          fi
+
+          ls -lh apk/ || true
+          FILE=$(find apk -maxdepth 1 -type f -printf '%s\t%p\n' | sort -rn | head -n1 | cut -f2-)
+          echo "APK_FILE=$FILE" >> "$GITHUB_ENV"
+          echo "using: $FILE"
+
+      - name: Install and stream
+        run: |
+          set -x
+          if [ -n "${APK_FILE:-}" ] && [ -f "$APK_FILE" ]; then
+            # adb refuses anything not ending .apk, whatever the file really is.
+            cp "$APK_FILE" /tmp/install.apk
+            if unzip -l /tmp/install.apk 2>/dev/null | grep -q 'AndroidManifest.xml'; then
+              adb install -r -g /tmp/install.apk || echo "INSTALL FAILED - need universal/x86_64"
+            else
+              rm -rf split && mkdir -p split
+              unzip -o -q "$APK_FILE" -d split
+              find split -name '*.apk'
+              # x86_64 emulator: drop ARM splits or the install refuses
+              FILES=$(find split -name '*.apk' | grep -vE 'armeabi|arm64' | tr '\n' ' ')
+              adb install-multiple -r -g $FILES || \
+                adb install-multiple -r -g $(find split -name '*.apk')
+            fi
+          fi
+
+          if adb shell pm list packages 2>/dev/null | grep -qi 'package:com.roblox.client'; then
+            echo "ROBLOX INSTALLED OK"
+
+            # --- force Roblox's cheapest graphics preset --------------------
+            # All of these are on Roblox's own local-config allowlist.
+            FFLAGS='{"DFIntDebugFRMQualityLevelOverride":"1","FIntDebugForceMSAASamples":"1","DFFlagTextureQualityOverrideEnabled":"True","DFIntTextureQualityOverride":"1","FIntFRMMaxGrassDistance":"0","FIntFRMMinGrassDistance":"0","FIntGrassMovementReducedMotionFactor":"0","DFIntCSGLevelOfDetailSwitchingDistance":"100","DFIntCSGLevelOfDetailSwitchingDistanceL12":"100","DFIntCSGLevelOfDetailSwitchingDistanceL23":"200","DFIntCSGLevelOfDetailSwitchingDistanceL34":"300"}'
+            if [ "${{ github.event.inputs.force_vulkan }}" = "true" ]; then
+              FFLAGS=$(printf '%s' "$FFLAGS" | sed 's/}$/,"FFlagDebugGraphicsPreferVulkan":"True"}/')
+              echo "ROBLOX RENDERER: Vulkan requested"
+            fi
+            printf '%s' "$FFLAGS" > /tmp/ClientAppSettings.json
+            adb root >/dev/null 2>&1 || true
+            sleep 4
+            adb push /tmp/ClientAppSettings.json /data/local/tmp/ClientAppSettings.json >/dev/null 2>&1 \
+              && echo "ROBLOX QUALITY: flags in /data/local/tmp" || true
+            adb shell 'mkdir -p /data/data/com.roblox.client/files/exe/ClientSettings' 2>/dev/null || true
+            if adb push /tmp/ClientAppSettings.json \
+                /data/data/com.roblox.client/files/exe/ClientSettings/ClientAppSettings.json >/dev/null 2>&1; then
+              echo "ROBLOX QUALITY: flags next to the client"
+            else
+              echo "ROBLOX QUALITY: app dir not writable (the /data/local/tmp copy still counts)"
+            fi
+
+            adb shell monkey -p com.roblox.client -c android.intent.category.LAUNCHER 1 || true
+          else
+            echo "ROBLOX_NOT_INSTALLED - the download or the install failed, see the lines above"
+          fi
+
+          git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git client
+          # This image declares a hardware keyboard, so Roblox accepts real key
+          # events: turn ws-scrcpy's keyboard capture on by default instead of
+          # waiting for the user to tick the box.
+          perl -0pi -e "s/Util\.parseBoolean\(params, 'captureKeyboard', false\)/Util.parseBoolean(params, 'captureKeyboard', true)/" \
+            client/src/app/googDevice/client/StreamClientScrcpy.ts
+          grep -q "captureKeyboard', true" client/src/app/googDevice/client/StreamClientScrcpy.ts \
+            && echo "KEYBOARD CAPTURE: on (WASD is native here)" \
+            || echo "KEYBOARD CAPTURE: patch missed"
+
+          # Both players get the same caps: MSE (fallback) and WebCodecs (the
+          # one the page auto-opens, because Chrome decodes it in hardware).
+          for f in MsePlayer WebCodecsPlayer; do
+            perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: 4194304, maxFps: 30, iFrameInterval: 5, bounds: new Size(640, 640), sendFrameMeta: false });/s' \
+              "client/src/app/player/$f.ts"
+          done
+          if grep -q 'bitrate: 4194304' client/src/app/player/MsePlayer.ts \
+            && grep -q 'bitrate: 4194304' client/src/app/player/WebCodecsPlayer.ts; then
+            echo "STREAM TUNED: 30fps / 4Mbps / 640x360 (MSE + WebCodecs)"
+          else
+            echo "STREAM TUNE MISSED - using ws-scrcpy defaults"
+          fi
+
+          ( cd client && npm install --no-audit --no-fund && npm run dist ) > /tmp/ws-build.log 2>&1
+          if [ -f client/dist/public/index.html ]; then
+            echo "web client built"
+          else
+            echo "WEB CLIENT BUILD FAILED"
+            tail -n 30 /tmp/ws-build.log
+          fi
+
+          set +x
+          echo 'Ly8gSW5qZWN0ZWQgaW50byB0aGUgd3Mtc2NyY3B5IHBhZ2U6IG9wZW5zIHRoZSBzdHJlYW0gYnkgaXRzZWxmLgovLyBQcmVmZXJzIFdlYkNvZGVjcyAoaGFyZHdhcmUgZGVjb2RlIGluIENocm9tZSA9IGxvd2VzdCBkZWxheSksIGZhbGxzIGJhY2sgdG8KLy8gdGhlIE1TRSBwbGF5ZXIgaWYgdGhlIGJyb3dzZXIgaGFzIG5vIFZpZGVvRGVjb2Rlci4KKGZ1bmN0aW9uICgpIHsKICB2YXIgb3BlbmVkID0gZmFsc2U7CiAgZnVuY3Rpb24gdGljaygpIHsKICAgIGlmIChvcGVuZWQgfHwgKGxvY2F0aW9uLmhhc2ggJiYgbG9jYXRpb24uaGFzaC5pbmRleE9mKCdhY3Rpb249c3RyZWFtJykgIT09IC0xKSkgcmV0dXJuOwogICAgdmFyIGxpbmtzID0gZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnYVtocmVmKj0iYWN0aW9uPXN0cmVhbSJdJyk7CiAgICBpZiAoIWxpbmtzLmxlbmd0aCkgcmV0dXJuOwogICAgdmFyIHdhbnQgPSB0eXBlb2Ygd2luZG93LlZpZGVvRGVjb2RlciA9PT0gJ2Z1bmN0aW9uJyA/ICdwbGF5ZXI9d2ViY29kZWNzJyA6ICdwbGF5ZXI9bXNlJzsKICAgIGZvciAodmFyIGkgPSAwOyBpIDwgbGlua3MubGVuZ3RoOyBpKyspIHsKICAgICAgaWYgKGxpbmtzW2ldLmhyZWYuaW5kZXhPZih3YW50KSAhPT0gLTEpIHsKICAgICAgICBvcGVuZWQgPSB0cnVlOwogICAgICAgIGxvY2F0aW9uLmhyZWYgPSBsaW5rc1tpXS5ocmVmOwogICAgICAgIHJldHVybjsKICAgICAgfQogICAgfQogIH0KICBzZXRJbnRlcnZhbCh0aWNrLCAyMDAwKTsKfSkoKTsK' | base64 -d > /tmp/autostream.js
+          cd client/dist && nohup node index.js > /tmp/ws.log 2>&1 &
+          set -x
+          sleep 6
+
+          curl -fL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          # http2 = plain TCP 443. School/guest wifi often blocks the UDP that
+          # cloudflared's default QUIC transport needs, which shows up as stutter.
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          sleep 30
+          URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n 1)
+
+          # Make the page open the stream itself, on the lowest-latency player.
+          PAGE=client/dist/public/index.html
+          if [ -f "$PAGE" ]; then
+            cp /tmp/autostream.js client/dist/public/keys.js
+            grep -q 'keys.js' "$PAGE" \
+              || perl -0pi -e 's#</body>#<script src="keys.js"></script></body>#' "$PAGE"
+            grep -q 'keys.js' "$PAGE" \
+              || echo '<script src="keys.js"></script>' >> "$PAGE"
+            echo "AUTO-OPEN: installed"
+          else
+            echo "PAGE MISSING - open the device from the list manually"
+          fi
+
+          echo "=============================================="
+          echo "$URL"
+          echo "=============================================="
+          [ -n "$URL" ] || tail -n 20 /tmp/tunnel.log
+
+          sleep 16000
