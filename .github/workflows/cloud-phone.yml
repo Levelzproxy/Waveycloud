@@ -1,0 +1,416 @@
+# Cloud Android phone on GitHub Actions (redroid edition).
+#
+# Needs: a PUBLIC repo, this file at .github/workflows/cloud-phone.yml,
+# then Actions -> cloud-phone -> Run workflow. No APK upload required.
+#
+# Why redroid instead of an emulator: GitHub's x86_64 Ubuntu runners already
+# ship the binder_linux and ashmem_linux kernel modules and allow privileged
+# Docker, so Android can boot as a container without KVM tricks.
+#
+# WHAT YOU GET: an Android screen in a browser tab, ~10 min after you hit Run,
+# for up to ~5 hours, with Roblox installed on it, WASD movement wired to the
+# on-screen thumbstick and spacebar wired to the jump button (Roblox ignores
+# injected key codes, so keys drive touch instead).
+# The page opens the stream by itself, using the WebCodecs player (hardware
+# decode in Chrome, lowest latency), falling back to MSE if that is unavailable.
+#
+# LIMITS, STATED ONCE: 6h cap, wiped after each run, and this is general-purpose
+# compute on a CI service (GitHub's Additional Product Terms restrict hosted
+# runners to work on the repo). Roblox will still treat it as not-a-phone when
+# you try to join a public game.
+#
+# WAVEY CLOUD: when the site dispatches this workflow it passes `session` and
+# `callback`. At the end of the run this job POSTs its own private stream link
+# to the site, which hands it to that one visitor. Nothing is shared between
+# runs: one run = one phone = one person's Roblox account.
+
+name: cloud-phone
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: "Optional direct APK/XAPK URL (leave empty to auto-download Roblox)"
+        required: false
+        default: ""
+      android:
+        description: "Android version: 15 (newest with a working display), 14, 13, 12, 11"
+        required: false
+        default: "15"
+      resolution:
+        description: "Screen: 854x480 (default, sharp), 1280x720 (sharpest, slowest), 640x360 (faster), 480x270 (fastest)"
+        required: false
+        default: "854x480"
+      jump_position:
+        description: "Only if space does not jump: jump button spot as x,y fractions of the screen (empty = automatic)"
+        required: false
+        default: ""
+      session:
+        description: "Set by the wavey-cloud site: id of the visitor this phone belongs to"
+        required: false
+        default: ""
+      callback:
+        description: "Set by the wavey-cloud site: where to POST this phone's stream link"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  phone:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    # Inputs arrive as env, never pasted into the shell text, so a strange
+    # value can not turn into commands.
+    env:
+      SESSION_INPUT: ${{ github.event.inputs.session }}
+      CALLBACK_INPUT: ${{ github.event.inputs.callback }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Android kernel modules + adb
+        run: |
+          set +e
+          echo "kernel: $(uname -r)"
+          echo "pages:  $(getconf PAGESIZE)"
+
+          # Runner images already ship binder_linux on x86_64. Only reach for apt
+          # if modprobe fails: the Azure kernel often has no matching
+          # linux-modules-extra package, and bash -e turns that into a 4s failure.
+          if ! sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"; then
+            echo "binder not loaded, trying package"
+            sudo apt-get update -qq || true
+            sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)" \
+              || sudo apt-get install -y -qq linux-modules-extra-azure \
+              || true
+            sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || true
+          fi
+
+          command -v adb >/dev/null || sudo apt-get install -y -qq adb
+          command -v unzip >/dev/null || sudo apt-get install -y -qq unzip
+          command -v curl >/dev/null || sudo apt-get install -y -qq curl
+
+          sudo mkdir -p /dev/binderfs
+          sudo mount -t binder binder /dev/binderfs || sudo mount -t binder none /dev/binderfs || true
+          echo "--- binderfs ---"
+          ls -l /dev/binderfs
+          grep -i binder /proc/filesystems
+
+      - name: Fetch Roblox
+        run: |
+          set -u
+          mkdir -p apk
+          UA='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
+
+          if [ -n "${{ github.event.inputs.apk_url }}" ]; then
+            curl -fL --retry 2 -A "$UA" -o apk/roblox.apk "${{ github.event.inputs.apk_url }}" || true
+          fi
+
+          if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
+            for u in \
+              "https://d.apkpure.com/b/XAPK/com.roblox.client?version=latest" \
+              "https://d.apkpure.com/b/APK/com.roblox.client?version=latest"
+            do
+              echo "trying $u"
+              code=$(curl -L --retry 3 --max-time 420 --compressed \
+                -H "User-Agent: $UA" \
+                -H "Accept: */*" \
+                -H "Referer: https://apkpure.com/" \
+                -o apk/roblox.apk -w '%{http_code}' "$u" || echo 000)
+              echo "http=$code size=$(stat -c%s apk/roblox.apk 2>/dev/null || echo 0)"
+              if [ "$code" = "200" ] && [ "$(stat -c%s apk/roblox.apk 2>/dev/null || echo 0)" -gt 5000000 ]; then
+                break
+              fi
+              rm -f apk/roblox.apk
+            done
+          fi
+
+          # Last resort: apkeep speaks APKPure's Cloudflare dance properly.
+          if ! find apk -maxdepth 1 -type f -size +5M | grep -q .; then
+            echo "APKPure blocked plain curl, trying apkeep"
+            mkdir -p ak
+            gh release download --repo EFForg/apkeep --pattern '*x86_64*linux*' --dir ak 2>/dev/null || true
+            AK=$(find ak -type f -name 'apkeep*' | head -n1)
+            if [ -n "$AK" ]; then
+              chmod +x "$AK"
+              "$AK" -a com.roblox.client -d apk-pure apk 2>&1 | tail -n 20 || true
+            fi
+          fi
+
+          ls -lh apk/ || true
+          FILE=$(find apk -maxdepth 1 -type f -printf '%s\t%p\n' | sort -rn | head -n1 | cut -f2-)
+          echo "APK_FILE=$FILE" >> "$GITHUB_ENV"
+          echo "using: $FILE"
+
+      - name: Start redroid
+        run: |
+          sudo service docker start || true
+          docker info >/dev/null
+
+          # Newest Android that redroid still gives a display for: 15. The 16
+          # line boots and answers adb but has no framebuffer, so scrcpy shows
+          # nothing there.
+          ANDROID="${{ github.event.inputs.android }}"
+          ANDROID="${ANDROID:-15}"
+          case "$ANDROID" in
+            11) IMG="redroid/redroid:11.0.0-latest" ;;
+            16) IMG="redroid/redroid:16.0.0_64only-latest" ;;
+            *)  IMG="redroid/redroid:${ANDROID}.0.0_64only-latest" ;;
+          esac
+          echo "image: $IMG"
+
+          # Pixels are the cheapest performance lever there is on a software
+          # renderer: cost is close to linear in shaded area.
+          RES="${{ github.event.inputs.resolution }}"
+          RES="${RES:-854x480}"
+          W="${RES%x*}"; H="${RES#*x}"
+          case "$W$H" in
+            ''|*[!0-9]*) W=854; H=480; RES=854x480 ;;
+          esac
+          echo "screen: ${W}x${H}"
+          echo "DEV_W=$W" >> "$GITHUB_ENV"
+          echo "DEV_H=$H" >> "$GITHUB_ENV"
+
+          # Encoder bitrate in bits/s: ~0.5 bit per pixel per frame at 30fps.
+          # This is the knob that decides crisp vs smeary: too low and the
+          # encoder throws away detail the browser then stretches, which reads
+          # as "pixelated and blurry" even when the resolution is fine.
+          VIDEO_BITRATE=$(( W * H * 15 ))
+          if [ "$VIDEO_BITRATE" -lt 2500000 ]; then VIDEO_BITRATE=2500000; fi
+          if [ "$VIDEO_BITRATE" -gt 12000000 ]; then VIDEO_BITRATE=12000000; fi
+          echo "bitrate: $(( VIDEO_BITRATE / 1000000 )) Mbps"
+          echo "VIDEO_BITRATE=$VIDEO_BITRATE" >> "$GITHUB_ENV"
+
+          # Where spacebar taps for jump. Empty (the normal case) means the key
+          # bridge uses Roblox's own TouchJump layout and needs no help.
+          JP="${{ github.event.inputs.jump_position }}"
+          JX=""
+          JY=""
+          case "$JP" in
+            *,*) JX="${JP%,*}"; JY="${JP#*,}" ;;
+          esac
+          case "$JX$JY" in
+            ''|*[!0-9.]*) JX=""; JY="" ;;
+          esac
+          if [ -n "$JX" ]; then echo "jump: ${JX}x${JY} (override)"; else echo "jump: automatic"; fi
+          echo "JUMP_X=$JX" >> "$GITHUB_ENV"
+          echo "JUMP_Y=$JY" >> "$GITHUB_ENV"
+
+          mkdir -p "$HOME/data"
+          # Landscape panel, because Roblox forces landscape anyway: a portrait
+          # screen gets rotated the moment the app starts, and touch coordinates
+          # measured in portrait then land off-screen (that broke WASD).
+          # 854x480 is the default because the browser then only mildly
+          # stretches the picture; 640x360 renders faster but looks softer.
+          # All four cores go to the container: the H.264 encoder and
+          # tunnel share them, but starving the renderer costs more than it saves.
+          docker run -d --privileged --name redroid \
+            --memory 8g --cpus 4 \
+            -v "$HOME/data:/data" \
+            -p 127.0.0.1:5555:5555 \
+            "$IMG" \
+            androidboot.redroid_width=$W \
+            androidboot.redroid_height=$H \
+            androidboot.redroid_dpi=160 \
+            androidboot.redroid_fps=30 \
+            androidboot.redroid_gpu_mode=guest \
+            androidboot.redroid_vm_heap=512m \
+            androidboot.use_memfd=1
+          sleep 5
+          docker logs redroid | tail -n 30 || true
+          for i in $(seq 1 60); do
+            adb connect localhost:5555 >/dev/null 2>&1 || true
+            if adb -s localhost:5555 shell getprop sys.boot_completed 2>/dev/null | grep -q 1; then
+              echo "booted after $((i*5))s"
+              break
+            fi
+            sleep 5
+          done
+          adb devices
+
+          # Animations are pure lag on a software renderer: turn them off.
+          for k in window_animation_scale transition_animation_scale animator_duration_scale; do
+            adb -s localhost:5555 shell settings put global "$k" 0 || true
+          done
+          adb -s localhost:5555 shell svc power stayon true || true
+          # Latch buffers without waiting for vsync: shaves a frame of latency and
+          # stops SurfaceFlinger from adding backpressure on a 30 Hz panel.
+          adb -s localhost:5555 shell setprop debug.sf.latch_unsignaled 1 || true
+          # Android 12+ blurs every dialog/recent-app surface in software. On a
+          # CPU renderer that is pure cost, so kill blurs and transparency.
+          adb -s localhost:5555 shell settings put global disable_window_blurs 1 || true
+          adb -s localhost:5555 shell settings put secure reduce_transparency 1 || true
+          echo "android: $(adb -s localhost:5555 shell getprop ro.build.version.release | tr -d '\r') (sdk $(adb -s localhost:5555 shell getprop ro.build.version.sdk | tr -d '\r'))"
+          echo "display: $(adb -s localhost:5555 shell wm size | tr -d '\r')"
+          adb -s localhost:5555 shell dumpsys input 2>/dev/null | grep -m1 -i SurfaceOrientation || true
+
+      - name: Install and stream
+        run: |
+          set -x
+          if [ -n "${APK_FILE:-}" ] && [ -f "$APK_FILE" ]; then
+            # adb refuses anything not ending .apk, whatever the file really is.
+            cp "$APK_FILE" /tmp/install.apk
+            if unzip -l /tmp/install.apk 2>/dev/null | grep -q 'AndroidManifest.xml'; then
+              adb -s localhost:5555 install -r -g /tmp/install.apk || echo "INSTALL FAILED - need universal/x86_64"
+            else
+              rm -rf split && mkdir -p split
+              unzip -o -q "$APK_FILE" -d split
+              find split -name '*.apk'
+              # redroid here is x86_64: drop ARM splits or the install refuses
+              FILES=$(find split -name '*.apk' | grep -vE 'armeabi|arm64' | tr '\n' ' ')
+              adb -s localhost:5555 install-multiple -r -g $FILES || \
+                adb -s localhost:5555 install-multiple -r -g $(find split -name '*.apk')
+            fi
+          fi
+          if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -qi 'package:com.roblox.client'; then
+            echo "ROBLOX INSTALLED OK"
+
+            # --- force Roblox's cheapest graphics preset --------------------
+            # Without a GPU the renderer is the whole bottleneck. These are all
+            # on Roblox's own local-config allowlist (the mechanism they added
+            # in 2025), so the client honours them:
+            #   quality level 1, no MSAA, cheapest textures, no grass, tight LOD.
+            FFLAGS='{"DFIntDebugFRMQualityLevelOverride":"1","FIntDebugForceMSAASamples":"1","DFFlagTextureQualityOverrideEnabled":"True","DFIntTextureQualityOverride":"1","FIntFRMMaxGrassDistance":"0","FIntFRMMinGrassDistance":"0","FIntGrassMovementReducedMotionFactor":"0","DFIntCSGLevelOfDetailSwitchingDistance":"100","DFIntCSGLevelOfDetailSwitchingDistanceL12":"100","DFIntCSGLevelOfDetailSwitchingDistanceL23":"200","DFIntCSGLevelOfDetailSwitchingDistanceL34":"300"}'
+            printf '%s' "$FFLAGS" > /tmp/ClientAppSettings.json
+            adb -s localhost:5555 root >/dev/null 2>&1 || true
+            sleep 4
+            adb -s localhost:5555 push /tmp/ClientAppSettings.json /data/local/tmp/ClientAppSettings.json >/dev/null 2>&1 \
+              && echo "ROBLOX QUALITY: flags in /data/local/tmp" || true
+            adb -s localhost:5555 shell 'mkdir -p /data/data/com.roblox.client/files/exe/ClientSettings' 2>/dev/null || true
+            if adb -s localhost:5555 push /tmp/ClientAppSettings.json \
+                /data/data/com.roblox.client/files/exe/ClientSettings/ClientAppSettings.json >/dev/null 2>&1; then
+              echo "ROBLOX QUALITY: flags next to the client"
+            else
+              echo "ROBLOX QUALITY: app dir not writable (the /data/local/tmp copy still counts)"
+            fi
+
+            adb -s localhost:5555 shell monkey -p com.roblox.client -c android.intent.category.LAUNCHER 1 || true
+          else
+            echo "ROBLOX_NOT_INSTALLED - the download or the install failed, see the lines above"
+          fi
+
+          # The key bridge needs `input motionevent` (Android 10+); say so once.
+          adb -s localhost:5555 shell input 2>&1 | grep -q motionevent \
+            && echo "KEY INPUT: motionevent supported" \
+            || echo "KEY INPUT: motionevent missing - WASD will not move"
+
+          git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git client
+          # ws-scrcpy's defaults are bad in one specific way: the WebCodecs
+          # player -- the one the page auto-opens -- asks for 0.5 Mbps inside
+          # a 480x480 bound, so the encoder downsamples the device screen and
+          # then starves it. That is the pixelated, smeary picture. MSE's
+          # defaults are better (7 Mbps / 720px) but still 60fps, which a
+          # GPU-less box cannot feed.
+          # Both players get: native device pixels (2048 bound = never
+          # downsample), 30fps, a 2s keyframe so movement recovers fast, and a
+          # bitrate scaled to the resolution from the step above.
+          for f in MsePlayer WebCodecsPlayer; do
+            perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: $ENV{VIDEO_BITRATE}, maxFps: 30, iFrameInterval: 2, bounds: new Size(2048, 2048), sendFrameMeta: false });/s' \
+              "client/src/app/player/$f.ts"
+          done
+          if grep -q "bitrate: $VIDEO_BITRATE" client/src/app/player/MsePlayer.ts \
+            && grep -q "bitrate: $VIDEO_BITRATE" client/src/app/player/WebCodecsPlayer.ts; then
+            echo "STREAM TUNED: 30fps / $(( VIDEO_BITRATE / 1000000 ))Mbps / ${DEV_W}x${DEV_H} (MSE + WebCodecs)"
+          else
+            echo "STREAM TUNE MISSED - picture will be pixelated (ws-scrcpy defaults)"
+          fi
+          # ws-scrcpy ships no prebuilt web client, so compile it here. `npm run
+          # dist` is the real script (there is no `build`); the page lands in
+          # client/dist/public/index.html.
+          ( cd client && npm install --no-audit --no-fund && npm run dist ) > /tmp/ws-build.log 2>&1
+          if [ -f client/dist/public/index.html ]; then
+            echo "web client built"
+            # The patch above is only real if it survived the bundle: check the
+            # served JS for this run's bitrate instead of trusting the source.
+            if grep -rq "$VIDEO_BITRATE" client/dist/public --include='*.js'; then
+              echo "STREAM SETTINGS IN THE PAGE: $VIDEO_BITRATE bit/s"
+            else
+              echo "STREAM SETTINGS NOT IN THE PAGE - the picture will be pixelated"
+            fi
+          else
+            echo "WEB CLIENT BUILD FAILED"
+            tail -n 30 /tmp/ws-build.log
+          fi
+
+          # --- WASD bridge ------------------------------------------------
+          # Roblox ignores scrcpy's injected key codes (it only turns keyboard
+          # controls on when Android sees a real hardware keyboard), so instead
+          # of faking keys this drags the on-screen thumbstick with real touches.
+          set +x
+          cp scripts/keyd.js /tmp/keyd.js
+          cp scripts/keys.js /tmp/keys.body.js
+
+          set -x
+          cd client/dist && nohup node index.js > /tmp/ws.log 2>&1 &
+          DEV_W=${DEV_W:-640} DEV_H=${DEV_H:-360} JUMP_X="$JUMP_X" JUMP_Y="$JUMP_Y" \
+            nohup node /tmp/keyd.js > /tmp/keyd.log 2>&1 &
+          sleep 5
+
+          curl -fL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          # http2 = plain TCP 443. School/guest wifi often blocks the UDP that
+          # cloudflared's default QUIC transport needs, which shows up as stutter.
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8000 --no-autoupdate > /tmp/tunnel.log 2>&1 &
+          nohup ./cloudflared tunnel --protocol http2 --url http://localhost:8001 --no-autoupdate > /tmp/tunnel2.log 2>&1 &
+          sleep 30
+          URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel.log | head -n 1)
+          KURL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/tunnel2.log | head -n 1)
+
+          # Bake this run's key-tunnel address into the page, so the browser
+          # knows where to send WASD. Loads with the page; nothing to click.
+          PAGE=client/dist/public/index.html
+          if [ -f "$PAGE" ]; then
+            { echo "window.__KEYURL='$KURL'; window.__DEVW=${DEV_W:-854}; window.__DEVH=${DEV_H:-480};"; cat /tmp/keys.body.js; } > client/dist/public/keys.js
+            grep -q 'keys.js' "$PAGE" \
+              || perl -0pi -e 's#</body>#<script src="keys.js"></script></body>#' "$PAGE"
+            grep -q 'keys.js' "$PAGE" \
+              || echo '<script src="keys.js"></script>' >> "$PAGE"
+            echo "WASD + space script installed in the page"
+            echo "INPUT: move and jump are both fingers sent by the page (no adb round trip), so they work together and hold-to-jump works"
+          else
+            echo "PAGE MISSING - WASD script not installed"
+          fi
+          if [ -n "$KURL" ]; then
+            echo "WASD + SPACE bridge ready (space = jump)"
+            echo "KEY DEBUG (only if keys do nothing): $KURL/state"
+          else
+            echo "WASD bridge OFF - no key tunnel"
+          fi
+
+          echo "=============================================="
+          echo "$URL"
+          echo "=============================================="
+          [ -n "$URL" ] || tail -n 20 /tmp/tunnel.log
+
+          # --- hand this phone to wavey-cloud ---------------------------------
+          # The site dispatched this run and is waiting for exactly one thing:
+          # this run's own stream link. Every run is its own runner, its own
+          # Android container and its own tunnel, so two visitors can never
+          # land on the same phone (or the same Roblox account). The link below
+          # is the stream itself, so the visitor never sees a device list.
+          SESSION="$SESSION_INPUT"
+          CALLBACK="$CALLBACK_INPUT"
+          case "$SESSION" in *[!A-Za-z0-9_-]*|"") SESSION="" ;; esac
+          case "$CALLBACK" in https://*) ;; *) CALLBACK="" ;; esac
+          if [ -n "$URL" ]; then
+            HOST="${URL#https://}"
+            STREAM="https://${HOST}/#!action=stream&udid=emulator-5554&player=webcodecs&ws=wss%3A%2F%2F${HOST}%2F%3Faction%3Dproxy-adb%26remote%3Dtcp%253A8886%26udid%3Demulator-5554&fitToScreen=true"
+            echo "DIRECT STREAM: $STREAM"
+            if [ -n "$SESSION" ] && [ -n "$CALLBACK" ]; then
+              BODY=$(printf '{"id":"%s","url":"%s"}' "$SESSION" "$STREAM")
+              for i in 1 2 3 4 5 6; do
+                if curl -fsS -m 20 -X POST "$CALLBACK" -H 'content-type: application/json' --data "$BODY"; then
+                  echo "WAVEY: phone handed to the site"
+                  break
+                fi
+                echo "WAVEY: callback attempt $i failed"
+                sleep 10
+              done
+            fi
+          fi
+
+          # Keep the phone alive as long as the job budget allows (~5h45m),
+          # which is what the site shows as the session clock.
+          sleep 20000
