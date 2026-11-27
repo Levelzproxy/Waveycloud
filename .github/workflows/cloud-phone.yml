@@ -202,28 +202,29 @@ jobs:
           grep -q 'bitrate: 4194304' client/src/app/player/MsePlayer.ts \
             && echo "STREAM TUNED: 30fps / 4Mbps / 432x768" \
             || echo "STREAM TUNE MISSED - using ws-scrcpy defaults"
-          cd client && npm install --no-audit --no-fund && npm run build || true
-          cd ..
+          # ws-scrcpy ships no prebuilt web client, so compile it here. `npm run
+          # dist` is the real script (there is no `build`); the page lands in
+          # client/dist/public/index.html.
+          ( cd client && npm install --no-audit --no-fund && npm run dist ) > /tmp/ws-build.log 2>&1
+          if [ -f client/dist/public/index.html ]; then
+            echo "web client built"
+          else
+            echo "WEB CLIENT BUILD FAILED"
+            tail -n 30 /tmp/ws-build.log
+          fi
 
           # --- WASD bridge ------------------------------------------------
           # Roblox ignores scrcpy's injected key codes (it only turns keyboard
           # controls on when Android sees a real hardware keyboard), so instead
           # of faking keys this drags the on-screen thumbstick with real touches.
+          set +x
           echo 'Ly8gV0FTRCAtPiBSb2Jsb3ggbW9iaWxlIHRodW1ic3RpY2ssIHZpYSBhZGIncyBgaW5wdXQgbW90aW9uZXZlbnRgLgovLyBSb2Jsb3ggaWdub3JlcyBzY3JjcHkncyBpbmplY3RlZCBrZXljb2RlcyAoaXQgb25seSB0dXJucyBvbiBrZXlib2FyZAovLyBjb250cm9scyB3aGVuIEFuZHJvaWQgcmVwb3J0cyBhIGhhcmR3YXJlIGtleWJvYXJkKSwgc28gaW5zdGVhZCBvZiBmYWtpbmcKLy8ga2V5cyB3ZSBkcml2ZSB0aGUgb24tc2NyZWVuIHN0aWNrIGV4YWN0bHkgbGlrZSBhIGZpbmdlciB3b3VsZC4KY29uc3QgaHR0cCA9IHJlcXVpcmUoJ2h0dHAnKTsKY29uc3QgeyBzcGF3biB9ID0gcmVxdWlyZSgnY2hpbGRfcHJvY2VzcycpOwoKY29uc3QgVyA9IHBhcnNlSW50KHByb2Nlc3MuZW52LkRFVl9XIHx8ICc0MzInLCAxMCk7CmNvbnN0IEggPSBwYXJzZUludChwcm9jZXNzLmVudi5ERVZfSCB8fCAnNzY4JywgMTApOwpjb25zdCBBWCA9IE1hdGgucm91bmQoVyAqIDAuMTMpOyAvLyB0aHVtYnN0aWNrIGNlbnRyZSAoZHluYW1pYyBzdGljayBhY2NlcHRzIGFueSB0b3VjaCBoZXJlKQpjb25zdCBBWSA9IE1hdGgucm91bmQoSCAqIDAuODApOwpjb25zdCBSID0gTWF0aC5yb3VuZChXICogMC4xNik7IC8vIGhvdyBmYXIgdG8gZHJhZyBmb3IgZnVsbCBzcGVlZAoKY29uc3Qgc2ggPSBzcGF3bignYWRiJywgWyctcycsICdsb2NhbGhvc3Q6NTU1NScsICdzaGVsbCddKTsKc2guc3Rkb3V0LnJlc3VtZSgpOwpzaC5zdGRlcnIucmVzdW1lKCk7CnNoLm9uKCdleGl0JywgKCkgPT4gcHJvY2Vzcy5leGl0KDApKTsKCmNvbnN0IGhlbGQgPSBPYmplY3QuY3JlYXRlKG51bGwpOwpsZXQgdG91Y2hpbmcgPSBmYWxzZTsKCmZ1bmN0aW9uIGNtZChjKSB7CiAgdHJ5IHsKICAgIHNoLnN0ZGluLndyaXRlKGMgKyAnXG4nKTsKICB9IGNhdGNoIChlKSB7CiAgICAvKiBhZGIgZGllZDsgdGhlIHN0cmVhbSBrZWVwcyB3b3JraW5nLCBrZXlzIGp1c3Qgc3RvcCAqLwogIH0KfQoKZnVuY3Rpb24gdXBkYXRlKCkgewogIGNvbnN0IGR4ID0gKGhlbGQuZCA/IDEgOiAwKSAtIChoZWxkLmEgPyAxIDogMCk7CiAgY29uc3QgZHkgPSAoaGVsZC5zID8gMSA6IDApIC0gKGhlbGQudyA/IDEgOiAwKTsKICBpZiAoZHggfHwgZHkpIHsKICAgIGNvbnN0IGxlbiA9IE1hdGguaHlwb3QoZHgsIGR5KTsKICAgIGNvbnN0IHggPSBNYXRoLnJvdW5kKEFYICsgKGR4IC8gbGVuKSAqIFIpOwogICAgY29uc3QgeSA9IE1hdGgucm91bmQoQVkgKyAoZHkgLyBsZW4pICogUik7CiAgICBpZiAoIXRvdWNoaW5nKSB7CiAgICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgRE9XTiAnICsgQVggKyAnICcgKyBBWSk7CiAgICAgIHRvdWNoaW5nID0gdHJ1ZTsKICAgIH0KICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgTU9WRSAnICsgeCArICcgJyArIHkpOwogIH0gZWxzZSBpZiAodG91Y2hpbmcpIHsKICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgTU9WRSAnICsgQVggKyAnICcgKyBBWSk7CiAgICBjbWQoJ2lucHV0IG1vdGlvbmV2ZW50IFVQICcgKyBBWCArICcgJyArIEFZKTsKICAgIHRvdWNoaW5nID0gZmFsc2U7CiAgfQp9CgpodHRwCiAgLmNyZWF0ZVNlcnZlcigocmVxLCByZXMpID0+IHsKICAgIHJlcy5zZXRIZWFkZXIoJ0FjY2Vzcy1Db250cm9sLUFsbG93LU9yaWdpbicsICcqJyk7CiAgICByZXMuc2V0SGVhZGVyKCdDYWNoZS1Db250cm9sJywgJ25vLXN0b3JlJyk7CiAgICBjb25zdCB1ID0gbmV3IFVSTChyZXEudXJsLCAnaHR0cDovL2xvY2FsaG9zdCcpOwogICAgaWYgKHUucGF0aG5hbWUgPT09ICcvaycpIHsKICAgICAgY29uc3QgayA9ICh1LnNlYXJjaFBhcmFtcy5nZXQoJ2tleScpIHx8ICcnKS50b0xvd2VyQ2FzZSgpOwogICAgICBjb25zdCBkb3duID0gdS5zZWFyY2hQYXJhbXMuZ2V0KCdkb3duJykgPT09ICcxJzsKICAgICAgaWYgKGsubGVuZ3RoID09PSAxICYmICd3YXNkJy5pbmRleE9mKGspICE9PSAtMSkgewogICAgICAgIGlmIChkb3duKSBoZWxkW2tdID0gMTsKICAgICAgICBlbHNlIGRlbGV0ZSBoZWxkW2tdOwogICAgICAgIHVwZGF0ZSgpOwogICAgICB9CiAgICB9CiAgICByZXMuZW5kKCdvaycpOwogIH0pCiAgLmxpc3Rlbig4MDAxLCAoKSA9PiBjb25zb2xlLmxvZygna2V5ZCBsaXN0ZW5pbmcgb24gODAwMScpKTsK' | base64 -d > /tmp/keyd.js
           echo 'Ly8gSW5qZWN0ZWQgaW50byB0aGUgd3Mtc2NyY3B5IHBhZ2U6IGZvcndhcmRzIFdBU0QgdG8gdGhlIGtleSBicmlkZ2UuCi8vIHdpbmRvdy5fX0tFWVVSTCBpcyBwcmVwZW5kZWQgYnkgdGhlIHdvcmtmbG93IChpdCBpcyB0aGUga2V5IHR1bm5lbCBvcmlnaW4pLgooZnVuY3Rpb24gKCkgewogIHZhciBiYXNlID0gd2luZG93Ll9fS0VZVVJMIHx8ICcnOwogIGlmICghYmFzZSkgcmV0dXJuOwogIHZhciBtYXAgPSB7CiAgICBLZXlXOiAndycsCiAgICBLZXlBOiAnYScsCiAgICBLZXlTOiAncycsCiAgICBLZXlEOiAnZCcsCiAgICBBcnJvd1VwOiAndycsCiAgICBBcnJvd0xlZnQ6ICdhJywKICAgIEFycm93RG93bjogJ3MnLAogICAgQXJyb3dSaWdodDogJ2QnLAogIH07CiAgdmFyIGhlbGQgPSBPYmplY3QuY3JlYXRlKG51bGwpOwogIGZ1bmN0aW9uIHNlbmQoaywgZG93bikgewogICAgdHJ5IHsKICAgICAgZmV0Y2goYmFzZSArICcvaz9rZXk9JyArIGsgKyAnJmRvd249JyArIChkb3duID8gMSA6IDApLCB7CiAgICAgICAgbW9kZTogJ25vLWNvcnMnLAogICAgICAgIGtlZXBhbGl2ZTogdHJ1ZSwKICAgICAgfSk7CiAgICB9IGNhdGNoIChlKSB7fQogIH0KICBmdW5jdGlvbiB0eXBpbmcodCkgewogICAgaWYgKCF0IHx8ICF0LnRhZ05hbWUpIHJldHVybiBmYWxzZTsKICAgIHZhciBuID0gdC50YWdOYW1lLnRvTG93ZXJDYXNlKCk7CiAgICBpZiAobiA9PT0gJ2lucHV0JyB8fCBuID09PSAndGV4dGFyZWEnIHx8IG4gPT09ICdzZWxlY3QnIHx8IHQuaXNDb250ZW50RWRpdGFibGUpIHJldHVybiB0cnVlOwogICAgcmV0dXJuICEhKHQuY2xvc2VzdCAmJiB0LmNsb3Nlc3QoJy54dGVybScpKTsKICB9CiAgd2luZG93LmFkZEV2ZW50TGlzdGVuZXIoCiAgICAna2V5ZG93bicsCiAgICBmdW5jdGlvbiAoZSkgewogICAgICB2YXIgayA9IG1hcFtlLmNvZGVdOwogICAgICBpZiAoIWsgfHwgdHlwaW5nKGUudGFyZ2V0KSkgcmV0dXJuOwogICAgICBlLnByZXZlbnREZWZhdWx0KCk7CiAgICAgIGlmICghaGVsZFtrXSkgewogICAgICAgIGhlbGRba10gPSAxOwogICAgICAgIHNlbmQoaywgMSk7CiAgICAgIH0KICAgIH0sCiAgICB0cnVlLAogICk7CiAgd2luZG93LmFkZEV2ZW50TGlzdGVuZXIoCiAgICAna2V5dXAnLAogICAgZnVuY3Rpb24gKGUpIHsKICAgICAgdmFyIGsgPSBtYXBbZS5jb2RlXTsKICAgICAgaWYgKCFrKSByZXR1cm47CiAgICAgIGlmIChoZWxkW2tdKSB7CiAgICAgICAgZGVsZXRlIGhlbGRba107CiAgICAgICAgc2VuZChrLCAwKTsKICAgICAgfQogICAgfSwKICAgIHRydWUsCiAgKTsKICB3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcignYmx1cicsIGZ1bmN0aW9uICgpIHsKICAgIE9iamVjdC5rZXlzKGhlbGQpLmZvckVhY2goZnVuY3Rpb24gKGspIHsKICAgICAgZGVsZXRlIGhlbGRba107CiAgICAgIHNlbmQoaywgMCk7CiAgICB9KTsKICB9KTsKfSkoKTsK' | base64 -d > /tmp/keys.body.js
 
-          nohup npm --prefix client start > /tmp/ws.log 2>&1 &
+          set -x
+          cd client/dist && nohup node index.js > /tmp/ws.log 2>&1 &
           DEV_W=432 DEV_H=768 nohup node /tmp/keyd.js > /tmp/keyd.log 2>&1 &
-          # `npm start` webpack-builds ws-scrcpy into client/dist before it serves
-          # anything, so wait for index.html to appear before touching it.
-          for i in $(seq 1 60); do
-            [ -f client/dist/index.html ] && break
-            sleep 5
-          done
           sleep 5
-          [ -f client/dist/index.html ] \
-            && echo "web client built" \
-            || { echo "WEB CLIENT BUILD FAILED"; tail -n 30 /tmp/ws.log; }
 
           curl -fL -o cloudflared \
             https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
@@ -238,12 +239,16 @@ jobs:
 
           # Bake this run's key-tunnel address into the page, so the browser
           # knows where to send WASD. Loads with the page; nothing to click.
-          if [ -f client/dist/index.html ]; then
-            { echo "window.__KEYURL='$KURL';"; cat /tmp/keys.body.js; } > client/dist/keys.js
-            grep -q 'keys.js' client/dist/index.html \
-              || perl -0pi -e 's#</body>#<script src="keys.js"></script></body>#' client/dist/index.html
-            grep -q 'keys.js' client/dist/index.html \
-              || echo '<script src="keys.js"></script>' >> client/dist/index.html
+          PAGE=client/dist/public/index.html
+          if [ -f "$PAGE" ]; then
+            { echo "window.__KEYURL='$KURL';"; cat /tmp/keys.body.js; } > client/dist/public/keys.js
+            grep -q 'keys.js' "$PAGE" \
+              || perl -0pi -e 's#</body>#<script src="keys.js"></script></body>#' "$PAGE"
+            grep -q 'keys.js' "$PAGE" \
+              || echo '<script src="keys.js"></script>' >> "$PAGE"
+            echo "WASD script installed in the page"
+          else
+            echo "PAGE MISSING - WASD script not installed"
           fi
           [ -n "$KURL" ] && echo "WASD bridge ready" || echo "WASD bridge OFF - no key tunnel"
 
