@@ -28,9 +28,13 @@ on:
         required: false
         default: ""
       android:
-        description: "Android version: 15 (newest), 13, 12 or 11 (fastest on a GPU-less box)"
+        description: "Android version: 15 (newest with a working display), 14, 13, 12, 11"
         required: false
         default: "15"
+      resolution:
+        description: "Screen: 640x360 (default), 480x270 (much faster), 854x480 (sharper, slower)"
+        required: false
+        default: "640x360"
 
 permissions:
   contents: read
@@ -121,29 +125,44 @@ jobs:
           sudo service docker start || true
           docker info >/dev/null
 
-          # Newer Android = newer device, but it is CPU-rendered either way
-          # (no GPU on a hosted runner), so 11 is the "make it fast" knob.
+          # Newest Android that redroid still gives a display for: 15. The 16
+          # line boots and answers adb but has no framebuffer, so scrcpy shows
+          # nothing there.
           ANDROID="${{ github.event.inputs.android }}"
-          ANDROID="${ANDROID:-13}"
+          ANDROID="${ANDROID:-15}"
           case "$ANDROID" in
             11) IMG="redroid/redroid:11.0.0-latest" ;;
+            16) IMG="redroid/redroid:16.0.0_64only-latest" ;;
             *)  IMG="redroid/redroid:${ANDROID}.0.0_64only-latest" ;;
           esac
           echo "image: $IMG"
+
+          # Pixels are the cheapest performance lever there is on a software
+          # renderer: cost is close to linear in shaded area.
+          RES="${{ github.event.inputs.resolution }}"
+          RES="${RES:-640x360}"
+          W="${RES%x*}"; H="${RES#*x}"
+          case "$W$H" in
+            ''|*[!0-9]*) W=640; H=360; RES=640x360 ;;
+          esac
+          echo "screen: ${W}x${H}"
+          echo "DEV_W=$W" >> "$GITHUB_ENV"
+          echo "DEV_H=$H" >> "$GITHUB_ENV"
 
           mkdir -p "$HOME/data"
           # Landscape panel, because Roblox forces landscape anyway: a portrait
           # screen gets rotated the moment the app starts, and touch coordinates
           # measured in portrait then land off-screen (that broke WASD).
           # 640x360 is also ~30% fewer pixels for SwiftShader to shade than
-          # 768x432, and --cpus 3 leaves a core for the H.264 encoder + tunnel.
+          # 768x432. All four cores go to the container: the H.264 encoder and
+          # tunnel share them, but starving the renderer costs more than it saves.
           docker run -d --privileged --name redroid \
-            --memory 8g --cpus 3 \
+            --memory 8g --cpus 4 \
             -v "$HOME/data:/data" \
             -p 127.0.0.1:5555:5555 \
             "$IMG" \
-            androidboot.redroid_width=640 \
-            androidboot.redroid_height=360 \
+            androidboot.redroid_width=$W \
+            androidboot.redroid_height=$H \
             androidboot.redroid_dpi=160 \
             androidboot.redroid_fps=30 \
             androidboot.redroid_gpu_mode=guest \
@@ -166,6 +185,14 @@ jobs:
             adb -s localhost:5555 shell settings put global "$k" 0 || true
           done
           adb -s localhost:5555 shell svc power stayon true || true
+          # Latch buffers without waiting for vsync: shaves a frame of latency and
+          # stops SurfaceFlinger from adding backpressure on a 30 Hz panel.
+          adb -s localhost:5555 shell setprop debug.sf.latch_unsignaled 1 || true
+          # Android 12+ blurs every dialog/recent-app surface in software. On a
+          # CPU renderer that is pure cost, so kill blurs and transparency.
+          adb -s localhost:5555 shell settings put global disable_window_blurs 1 || true
+          adb -s localhost:5555 shell settings put secure reduce_transparency 1 || true
+          echo "android: $(adb -s localhost:5555 shell getprop ro.build.version.release | tr -d '\r') (sdk $(adb -s localhost:5555 shell getprop ro.build.version.sdk | tr -d '\r'))"
           echo "display: $(adb -s localhost:5555 shell wm size | tr -d '\r')"
           adb -s localhost:5555 shell dumpsys input 2>/dev/null | grep -m1 -i SurfaceOrientation || true
 
@@ -189,6 +216,26 @@ jobs:
           fi
           if adb -s localhost:5555 shell pm list packages 2>/dev/null | grep -qi 'package:com.roblox.client'; then
             echo "ROBLOX INSTALLED OK"
+
+            # --- force Roblox's cheapest graphics preset --------------------
+            # Without a GPU the renderer is the whole bottleneck. These are all
+            # on Roblox's own local-config allowlist (the mechanism they added
+            # in 2025), so the client honours them:
+            #   quality level 1, no MSAA, cheapest textures, no grass, tight LOD.
+            FFLAGS='{"DFIntDebugFRMQualityLevelOverride":"1","FIntDebugForceMSAASamples":"1","DFFlagTextureQualityOverrideEnabled":"True","DFIntTextureQualityOverride":"1","FIntFRMMaxGrassDistance":"0","FIntFRMMinGrassDistance":"0","FIntGrassMovementReducedMotionFactor":"0","DFIntCSGLevelOfDetailSwitchingDistance":"100","DFIntCSGLevelOfDetailSwitchingDistanceL12":"100","DFIntCSGLevelOfDetailSwitchingDistanceL23":"200","DFIntCSGLevelOfDetailSwitchingDistanceL34":"300"}'
+            printf '%s' "$FFLAGS" > /tmp/ClientAppSettings.json
+            adb -s localhost:5555 root >/dev/null 2>&1 || true
+            sleep 4
+            adb -s localhost:5555 push /tmp/ClientAppSettings.json /data/local/tmp/ClientAppSettings.json >/dev/null 2>&1 \
+              && echo "ROBLOX QUALITY: flags in /data/local/tmp" || true
+            adb -s localhost:5555 shell 'mkdir -p /data/data/com.roblox.client/files/exe/ClientSettings' 2>/dev/null || true
+            if adb -s localhost:5555 push /tmp/ClientAppSettings.json \
+                /data/data/com.roblox.client/files/exe/ClientSettings/ClientAppSettings.json >/dev/null 2>&1; then
+              echo "ROBLOX QUALITY: flags next to the client"
+            else
+              echo "ROBLOX QUALITY: app dir not writable (the /data/local/tmp copy still counts)"
+            fi
+
             adb -s localhost:5555 shell monkey -p com.roblox.client -c android.intent.category.LAUNCHER 1 || true
           else
             echo "ROBLOX_NOT_INSTALLED - the download or the install failed, see the lines above"
@@ -206,7 +253,7 @@ jobs:
           # Both players get the same caps: MSE (fallback) and WebCodecs (the
           # one the page auto-opens, because Chrome decodes it in hardware).
           for f in MsePlayer WebCodecsPlayer; do
-            perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: 4194304, maxFps: 30, iFrameInterval: 5, bounds: new Size(640, 640), sendFrameMeta: false });/s' \
+            perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: 4194304, maxFps: 30, iFrameInterval: 5, bounds: new Size(1024, 1024), sendFrameMeta: false });/s' \
               "client/src/app/player/$f.ts"
           done
           if grep -q 'bitrate: 4194304' client/src/app/player/MsePlayer.ts \
@@ -236,7 +283,7 @@ jobs:
 
           set -x
           cd client/dist && nohup node index.js > /tmp/ws.log 2>&1 &
-          DEV_W=640 DEV_H=360 nohup node /tmp/keyd.js > /tmp/keyd.log 2>&1 &
+          DEV_W=${DEV_W:-640} DEV_H=${DEV_H:-360} nohup node /tmp/keyd.js > /tmp/keyd.log 2>&1 &
           sleep 5
 
           curl -fL -o cloudflared \
