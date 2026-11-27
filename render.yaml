@@ -1,0 +1,20 @@
+# Render blueprint for Wavey Cloud.
+# Render → New → Blueprint → pick this repo. It asks for the two values below.
+services:
+  - type: web
+    name: wavey-cloud
+    runtime: node
+    plan: free
+    buildCommand: npm install --omit=dev
+    startCommand: node server/index.js
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: GITHUB_REPO
+        sync: false # e.g. yourname/your-repo
+      - key: GITHUB_TOKEN
+        sync: false # fine-grained token, Actions: read & write on that repo
+      - key: GITHUB_REF
+        value: main
+      - key: MAX_SESSIONS
+        value: "8"

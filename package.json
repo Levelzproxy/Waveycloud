@@ -1,0 +1,13 @@
+{
+  "name": "wavey-cloud",
+  "private": true,
+  "type": "module",
+  "description": "One private cloud phone per visitor, streamed in the browser.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node server/test.mjs"
+  }
+}
