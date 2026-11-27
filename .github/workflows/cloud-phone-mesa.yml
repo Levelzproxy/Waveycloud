@@ -78,12 +78,45 @@ jobs:
           echo "$SDK/emulator" >> "$GITHUB_PATH"
           "$SDK/platform-tools/adb" version | head -n 1 || true
 
+          # Pin where AVDs live. Without this, avdmanager may use
+          # $ANDROID_USER_HOME / $ANDROID_SDK_HOME instead of ~/.android/avd,
+          # and later steps cannot find config.ini.
+          mkdir -p "$HOME/.android/avd"
+          echo "ANDROID_AVD_HOME=$HOME/.android/avd" >> "$GITHUB_ENV"
+
+          IMG="$SDK/system-images/android-${{ github.event.inputs.api_level }}/google_apis/x86_64"
+          if [ -d "$IMG" ]; then
+            echo "SYSTEM IMAGE: present"
+          else
+            echo "SYSTEM IMAGE MISSING: $IMG"
+            tail -n 30 /tmp/sdk.log
+          fi
+
       - name: Create AVD (640x360, hardware keyboard)
         run: |
           set -x
-          echo no | "$AV" create avd -n mesa \
-            -k "system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64" --force
-          CFG="$HOME/.android/avd/mesa.avd/config.ini"
+          export ANDROID_AVD_HOME="${ANDROID_AVD_HOME:-$HOME/.android/avd}"
+          mkdir -p "$ANDROID_AVD_HOME"
+          IMAGE="system-images;android-${{ github.event.inputs.api_level }};google_apis;x86_64"
+
+          "$AV" delete avd -n mesa >/dev/null 2>&1 || true
+          echo no | "$AV" create avd -n mesa -k "$IMAGE" --force 2>&1 | tail -n 12
+
+          # Ask avdmanager where it actually put the thing instead of assuming.
+          CFG=$("$AV" list avd 2>/dev/null | awk -F': ' '/Path:/ && $2 ~ /mesa/ {print $2 "/config.ini"}' | head -n 1)
+          if [ -z "$CFG" ] || [ ! -f "$CFG" ]; then
+            echo "create did not land, retrying with an explicit device profile"
+            echo no | "$AV" create avd -n mesa -d pixel -k "$IMAGE" --force 2>&1 | tail -n 12
+            CFG=$("$AV" list avd 2>/dev/null | awk -F': ' '/Path:/ && $2 ~ /mesa/ {print $2 "/config.ini"}' | head -n 1)
+          fi
+          "$AV" list avd 2>&1 | head -n 20
+          if [ -z "$CFG" ] || [ ! -f "$CFG" ]; then
+            echo "AVD CREATION FAILED - no config.ini found"
+            ls -la "$ANDROID_AVD_HOME" || true
+            exit 1
+          fi
+          echo "config: $CFG"
+
           printf '%s\n' \
             'hw.lcd.width=640' \
             'hw.lcd.height=360' \
