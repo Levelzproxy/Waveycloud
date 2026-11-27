@@ -10,6 +10,8 @@
 # WHAT YOU GET: an Android screen in a browser tab, ~10 min after you hit Run,
 # for up to ~5 hours, with Roblox installed on it and WASD movement wired to the
 # on-screen thumbstick (Roblox ignores injected key codes, so keys drive touch).
+# The page opens the stream by itself, using the WebCodecs player (hardware
+# decode in Chrome, lowest latency), falling back to MSE if that is unavailable.
 #
 # LIMITS, STATED ONCE: 6h cap, wiped after each run, and this is general-purpose
 # compute on a CI service (GitHub's Additional Product Terms restrict hosted
@@ -26,9 +28,9 @@ on:
         required: false
         default: ""
       android:
-        description: "Android version: 13 (newest tested), 12, or 11 (fastest on a GPU-less box)"
+        description: "Android version: 15 (newest), 13, 12 or 11 (fastest on a GPU-less box)"
         required: false
-        default: "13"
+        default: "15"
 
 permissions:
   contents: read
@@ -130,17 +132,19 @@ jobs:
           echo "image: $IMG"
 
           mkdir -p "$HOME/data"
-          # Every pixel is CPU work under SwiftShader, so 432x768 (same dp:
-          # 384dp wide, so the UI lays out identically, just fewer pixels to
-          # shade). --cpus 3 leaves one core for the H.264 encoder + tunnel.
+          # Landscape panel, because Roblox forces landscape anyway: a portrait
+          # screen gets rotated the moment the app starts, and touch coordinates
+          # measured in portrait then land off-screen (that broke WASD).
+          # 640x360 is also ~30% fewer pixels for SwiftShader to shade than
+          # 768x432, and --cpus 3 leaves a core for the H.264 encoder + tunnel.
           docker run -d --privileged --name redroid \
             --memory 8g --cpus 3 \
             -v "$HOME/data:/data" \
             -p 127.0.0.1:5555:5555 \
             "$IMG" \
-            androidboot.redroid_width=432 \
-            androidboot.redroid_height=768 \
-            androidboot.redroid_dpi=180 \
+            androidboot.redroid_width=640 \
+            androidboot.redroid_height=360 \
+            androidboot.redroid_dpi=160 \
             androidboot.redroid_fps=30 \
             androidboot.redroid_gpu_mode=guest \
             androidboot.redroid_vm_heap=512m \
@@ -162,6 +166,8 @@ jobs:
             adb -s localhost:5555 shell settings put global "$k" 0 || true
           done
           adb -s localhost:5555 shell svc power stayon true || true
+          echo "display: $(adb -s localhost:5555 shell wm size | tr -d '\r')"
+          adb -s localhost:5555 shell dumpsys input 2>/dev/null | grep -m1 -i SurfaceOrientation || true
 
       - name: Install and stream
         run: |
@@ -195,13 +201,20 @@ jobs:
 
           git clone --depth 1 https://github.com/NetrisTV/ws-scrcpy.git client
           # ws-scrcpy defaults to 60 fps / 7 Mbps / 720px, which is what makes a
-          # GPU-less box feel laggy. 4 Mbps is generous for 432x768, so the
+          # GPU-less box feel laggy. 4 Mbps is generous for 640x360, so the
           # picture stays clean while the encoder has far less to do.
-          perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: 4194304, maxFps: 30, iFrameInterval: 5, bounds: new Size(768, 768), sendFrameMeta: false });/s' \
-            client/src/app/player/MsePlayer.ts
-          grep -q 'bitrate: 4194304' client/src/app/player/MsePlayer.ts \
-            && echo "STREAM TUNED: 30fps / 4Mbps / 432x768" \
-            || echo "STREAM TUNE MISSED - using ws-scrcpy defaults"
+          # Both players get the same caps: MSE (fallback) and WebCodecs (the
+          # one the page auto-opens, because Chrome decodes it in hardware).
+          for f in MsePlayer WebCodecsPlayer; do
+            perl -0pi -e 's/preferredVideoSettings: VideoSettings = new VideoSettings\(\{[^}]*\}\);/preferredVideoSettings: VideoSettings = new VideoSettings({ lockedVideoOrientation: -1, bitrate: 4194304, maxFps: 30, iFrameInterval: 5, bounds: new Size(640, 640), sendFrameMeta: false });/s' \
+              "client/src/app/player/$f.ts"
+          done
+          if grep -q 'bitrate: 4194304' client/src/app/player/MsePlayer.ts \
+            && grep -q 'bitrate: 4194304' client/src/app/player/WebCodecsPlayer.ts; then
+            echo "STREAM TUNED: 30fps / 4Mbps / 640x360 (MSE + WebCodecs)"
+          else
+            echo "STREAM TUNE MISSED - using ws-scrcpy defaults"
+          fi
           # ws-scrcpy ships no prebuilt web client, so compile it here. `npm run
           # dist` is the real script (there is no `build`); the page lands in
           # client/dist/public/index.html.
@@ -218,12 +231,12 @@ jobs:
           # controls on when Android sees a real hardware keyboard), so instead
           # of faking keys this drags the on-screen thumbstick with real touches.
           set +x
-          echo 'Ly8gV0FTRCAtPiBSb2Jsb3ggbW9iaWxlIHRodW1ic3RpY2ssIHZpYSBhZGIncyBgaW5wdXQgbW90aW9uZXZlbnRgLgovLyBSb2Jsb3ggaWdub3JlcyBzY3JjcHkncyBpbmplY3RlZCBrZXljb2RlcyAoaXQgb25seSB0dXJucyBvbiBrZXlib2FyZAovLyBjb250cm9scyB3aGVuIEFuZHJvaWQgcmVwb3J0cyBhIGhhcmR3YXJlIGtleWJvYXJkKSwgc28gaW5zdGVhZCBvZiBmYWtpbmcKLy8ga2V5cyB3ZSBkcml2ZSB0aGUgb24tc2NyZWVuIHN0aWNrIGV4YWN0bHkgbGlrZSBhIGZpbmdlciB3b3VsZC4KY29uc3QgaHR0cCA9IHJlcXVpcmUoJ2h0dHAnKTsKY29uc3QgeyBzcGF3biB9ID0gcmVxdWlyZSgnY2hpbGRfcHJvY2VzcycpOwoKY29uc3QgVyA9IHBhcnNlSW50KHByb2Nlc3MuZW52LkRFVl9XIHx8ICc0MzInLCAxMCk7CmNvbnN0IEggPSBwYXJzZUludChwcm9jZXNzLmVudi5ERVZfSCB8fCAnNzY4JywgMTApOwpjb25zdCBBWCA9IE1hdGgucm91bmQoVyAqIDAuMTMpOyAvLyB0aHVtYnN0aWNrIGNlbnRyZSAoZHluYW1pYyBzdGljayBhY2NlcHRzIGFueSB0b3VjaCBoZXJlKQpjb25zdCBBWSA9IE1hdGgucm91bmQoSCAqIDAuODApOwpjb25zdCBSID0gTWF0aC5yb3VuZChXICogMC4xNik7IC8vIGhvdyBmYXIgdG8gZHJhZyBmb3IgZnVsbCBzcGVlZAoKY29uc3Qgc2ggPSBzcGF3bignYWRiJywgWyctcycsICdsb2NhbGhvc3Q6NTU1NScsICdzaGVsbCddKTsKc2guc3Rkb3V0LnJlc3VtZSgpOwpzaC5zdGRlcnIucmVzdW1lKCk7CnNoLm9uKCdleGl0JywgKCkgPT4gcHJvY2Vzcy5leGl0KDApKTsKCmNvbnN0IGhlbGQgPSBPYmplY3QuY3JlYXRlKG51bGwpOwpsZXQgdG91Y2hpbmcgPSBmYWxzZTsKCmZ1bmN0aW9uIGNtZChjKSB7CiAgdHJ5IHsKICAgIHNoLnN0ZGluLndyaXRlKGMgKyAnXG4nKTsKICB9IGNhdGNoIChlKSB7CiAgICAvKiBhZGIgZGllZDsgdGhlIHN0cmVhbSBrZWVwcyB3b3JraW5nLCBrZXlzIGp1c3Qgc3RvcCAqLwogIH0KfQoKZnVuY3Rpb24gdXBkYXRlKCkgewogIGNvbnN0IGR4ID0gKGhlbGQuZCA/IDEgOiAwKSAtIChoZWxkLmEgPyAxIDogMCk7CiAgY29uc3QgZHkgPSAoaGVsZC5zID8gMSA6IDApIC0gKGhlbGQudyA/IDEgOiAwKTsKICBpZiAoZHggfHwgZHkpIHsKICAgIGNvbnN0IGxlbiA9IE1hdGguaHlwb3QoZHgsIGR5KTsKICAgIGNvbnN0IHggPSBNYXRoLnJvdW5kKEFYICsgKGR4IC8gbGVuKSAqIFIpOwogICAgY29uc3QgeSA9IE1hdGgucm91bmQoQVkgKyAoZHkgLyBsZW4pICogUik7CiAgICBpZiAoIXRvdWNoaW5nKSB7CiAgICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgRE9XTiAnICsgQVggKyAnICcgKyBBWSk7CiAgICAgIHRvdWNoaW5nID0gdHJ1ZTsKICAgIH0KICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgTU9WRSAnICsgeCArICcgJyArIHkpOwogIH0gZWxzZSBpZiAodG91Y2hpbmcpIHsKICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgTU9WRSAnICsgQVggKyAnICcgKyBBWSk7CiAgICBjbWQoJ2lucHV0IG1vdGlvbmV2ZW50IFVQICcgKyBBWCArICcgJyArIEFZKTsKICAgIHRvdWNoaW5nID0gZmFsc2U7CiAgfQp9CgpodHRwCiAgLmNyZWF0ZVNlcnZlcigocmVxLCByZXMpID0+IHsKICAgIHJlcy5zZXRIZWFkZXIoJ0FjY2Vzcy1Db250cm9sLUFsbG93LU9yaWdpbicsICcqJyk7CiAgICByZXMuc2V0SGVhZGVyKCdDYWNoZS1Db250cm9sJywgJ25vLXN0b3JlJyk7CiAgICBjb25zdCB1ID0gbmV3IFVSTChyZXEudXJsLCAnaHR0cDovL2xvY2FsaG9zdCcpOwogICAgaWYgKHUucGF0aG5hbWUgPT09ICcvaycpIHsKICAgICAgY29uc3QgayA9ICh1LnNlYXJjaFBhcmFtcy5nZXQoJ2tleScpIHx8ICcnKS50b0xvd2VyQ2FzZSgpOwogICAgICBjb25zdCBkb3duID0gdS5zZWFyY2hQYXJhbXMuZ2V0KCdkb3duJykgPT09ICcxJzsKICAgICAgaWYgKGsubGVuZ3RoID09PSAxICYmICd3YXNkJy5pbmRleE9mKGspICE9PSAtMSkgewogICAgICAgIGlmIChkb3duKSBoZWxkW2tdID0gMTsKICAgICAgICBlbHNlIGRlbGV0ZSBoZWxkW2tdOwogICAgICAgIHVwZGF0ZSgpOwogICAgICB9CiAgICB9CiAgICByZXMuZW5kKCdvaycpOwogIH0pCiAgLmxpc3Rlbig4MDAxLCAoKSA9PiBjb25zb2xlLmxvZygna2V5ZCBsaXN0ZW5pbmcgb24gODAwMScpKTsK' | base64 -d > /tmp/keyd.js
-          echo 'Ly8gSW5qZWN0ZWQgaW50byB0aGUgd3Mtc2NyY3B5IHBhZ2U6IGZvcndhcmRzIFdBU0QgdG8gdGhlIGtleSBicmlkZ2UuCi8vIHdpbmRvdy5fX0tFWVVSTCBpcyBwcmVwZW5kZWQgYnkgdGhlIHdvcmtmbG93IChpdCBpcyB0aGUga2V5IHR1bm5lbCBvcmlnaW4pLgooZnVuY3Rpb24gKCkgewogIHZhciBiYXNlID0gd2luZG93Ll9fS0VZVVJMIHx8ICcnOwogIGlmICghYmFzZSkgcmV0dXJuOwogIHZhciBtYXAgPSB7CiAgICBLZXlXOiAndycsCiAgICBLZXlBOiAnYScsCiAgICBLZXlTOiAncycsCiAgICBLZXlEOiAnZCcsCiAgICBBcnJvd1VwOiAndycsCiAgICBBcnJvd0xlZnQ6ICdhJywKICAgIEFycm93RG93bjogJ3MnLAogICAgQXJyb3dSaWdodDogJ2QnLAogIH07CiAgdmFyIGhlbGQgPSBPYmplY3QuY3JlYXRlKG51bGwpOwogIGZ1bmN0aW9uIHNlbmQoaywgZG93bikgewogICAgdHJ5IHsKICAgICAgZmV0Y2goYmFzZSArICcvaz9rZXk9JyArIGsgKyAnJmRvd249JyArIChkb3duID8gMSA6IDApLCB7CiAgICAgICAgbW9kZTogJ25vLWNvcnMnLAogICAgICAgIGtlZXBhbGl2ZTogdHJ1ZSwKICAgICAgfSk7CiAgICB9IGNhdGNoIChlKSB7fQogIH0KICBmdW5jdGlvbiB0eXBpbmcodCkgewogICAgaWYgKCF0IHx8ICF0LnRhZ05hbWUpIHJldHVybiBmYWxzZTsKICAgIHZhciBuID0gdC50YWdOYW1lLnRvTG93ZXJDYXNlKCk7CiAgICBpZiAobiA9PT0gJ2lucHV0JyB8fCBuID09PSAndGV4dGFyZWEnIHx8IG4gPT09ICdzZWxlY3QnIHx8IHQuaXNDb250ZW50RWRpdGFibGUpIHJldHVybiB0cnVlOwogICAgcmV0dXJuICEhKHQuY2xvc2VzdCAmJiB0LmNsb3Nlc3QoJy54dGVybScpKTsKICB9CiAgd2luZG93LmFkZEV2ZW50TGlzdGVuZXIoCiAgICAna2V5ZG93bicsCiAgICBmdW5jdGlvbiAoZSkgewogICAgICB2YXIgayA9IG1hcFtlLmNvZGVdOwogICAgICBpZiAoIWsgfHwgdHlwaW5nKGUudGFyZ2V0KSkgcmV0dXJuOwogICAgICBlLnByZXZlbnREZWZhdWx0KCk7CiAgICAgIGlmICghaGVsZFtrXSkgewogICAgICAgIGhlbGRba10gPSAxOwogICAgICAgIHNlbmQoaywgMSk7CiAgICAgIH0KICAgIH0sCiAgICB0cnVlLAogICk7CiAgd2luZG93LmFkZEV2ZW50TGlzdGVuZXIoCiAgICAna2V5dXAnLAogICAgZnVuY3Rpb24gKGUpIHsKICAgICAgdmFyIGsgPSBtYXBbZS5jb2RlXTsKICAgICAgaWYgKCFrKSByZXR1cm47CiAgICAgIGlmIChoZWxkW2tdKSB7CiAgICAgICAgZGVsZXRlIGhlbGRba107CiAgICAgICAgc2VuZChrLCAwKTsKICAgICAgfQogICAgfSwKICAgIHRydWUsCiAgKTsKICB3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcignYmx1cicsIGZ1bmN0aW9uICgpIHsKICAgIE9iamVjdC5rZXlzKGhlbGQpLmZvckVhY2goZnVuY3Rpb24gKGspIHsKICAgICAgZGVsZXRlIGhlbGRba107CiAgICAgIHNlbmQoaywgMCk7CiAgICB9KTsKICB9KTsKfSkoKTsK' | base64 -d > /tmp/keys.body.js
+          echo 'Ly8gV0FTRCAtPiBSb2Jsb3gncyBvbi1zY3JlZW4gdGh1bWJzdGljaywgdmlhIGFkYiBgaW5wdXQgbW90aW9uZXZlbnRgLgovLwovLyBSb2Jsb3ggaWdub3JlcyBzY3JjcHkncyBpbmplY3RlZCBrZXkgY29kZXMgKGl0IG9ubHkgZW5hYmxlcyBrZXlib2FyZCBjb250cm9scwovLyB3aGVuIEFuZHJvaWQgcmVwb3J0cyBhIGhhcmR3YXJlIGtleWJvYXJkKSwgc28gdGhlIHN0aWNrIGlzIGRyYWdnZWQgd2l0aCByZWFsCi8vIHRvdWNoZXMgaW5zdGVhZC4gVGhlIGRldmljZSBib290cyBsYW5kc2NhcGUsIGJ1dCBSb2Jsb3ggY2FuIHN0aWxsIHJvdGF0ZSBpdCwKLy8gc28gdGhlIHNjcmVlbiBzaXplIGlzIGRlcml2ZWQgZnJvbSB0aGUgbGl2ZSBTdXJmYWNlT3JpZW50YXRpb24gcmF0aGVyIHRoYW4KLy8gYXNzdW1lZCAtLSB0aGF0IG1pc21hdGNoIGlzIHdoYXQgbWFkZSBlYXJsaWVyIGJ1aWxkcyBkbyBub3RoaW5nLgpjb25zdCBodHRwID0gcmVxdWlyZSgnaHR0cCcpOwpjb25zdCB7IHNwYXduLCBleGVjIH0gPSByZXF1aXJlKCdjaGlsZF9wcm9jZXNzJyk7Cgpjb25zdCBCQVNFX1cgPSBwYXJzZUludChwcm9jZXNzLmVudi5ERVZfVyB8fCAnNjQwJywgMTApOwpjb25zdCBCQVNFX0ggPSBwYXJzZUludChwcm9jZXNzLmVudi5ERVZfSCB8fCAnMzYwJywgMTApOwoKY29uc3Qgc2ggPSBzcGF3bignYWRiJywgWyctcycsICdsb2NhbGhvc3Q6NTU1NScsICdzaGVsbCddKTsKc2guc3Rkb3V0LnJlc3VtZSgpOwpzaC5zdGRlcnIucmVzdW1lKCk7CnNoLm9uKCdleGl0JywgKCkgPT4gcHJvY2Vzcy5leGl0KDApKTsKCmxldCByb3RhdGlvbiA9IDA7CmxldCBsYXN0RXJyb3IgPSAnJzsKbGV0IGxhc3RDb21tYW5kID0gJyc7CgpmdW5jdGlvbiByZWFkUm90YXRpb24oKSB7CiAgZXhlYygnYWRiIC1zIGxvY2FsaG9zdDo1NTU1IHNoZWxsIGR1bXBzeXMgaW5wdXQgfCBncmVwIC1tMSAtaSBTdXJmYWNlT3JpZW50YXRpb24nLCAoZXJyLCBvdXQpID0+IHsKICAgIGlmIChlcnIpIHsKICAgICAgbGFzdEVycm9yID0gU3RyaW5nKGVyci5tZXNzYWdlKS5zbGljZSgwLCAxMjApOwogICAgICByZXR1cm47CiAgICB9CiAgICBjb25zdCBtID0gL1N1cmZhY2VPcmllbnRhdGlvbjpccyooXGQpLy5leGVjKG91dCB8fCAnJyk7CiAgICBpZiAobSkgcm90YXRpb24gPSBwYXJzZUludChtWzFdLCAxMCkgJSA0OwogIH0pOwp9CnJlYWRSb3RhdGlvbigpOwpzZXRJbnRlcnZhbChyZWFkUm90YXRpb24sIDUwMDApLnVucmVmKCk7CgpmdW5jdGlvbiBzY3JlZW4oKSB7CiAgcmV0dXJuIHJvdGF0aW9uID09PSAxIHx8IHJvdGF0aW9uID09PSAzID8geyB3OiBCQVNFX0gsIGg6IEJBU0VfVyB9IDogeyB3OiBCQVNFX1csIGg6IEJBU0VfSCB9Owp9CgpmdW5jdGlvbiBhbmNob3IoKSB7CiAgY29uc3QgeyB3LCBoIH0gPSBzY3JlZW4oKTsKICByZXR1cm4gewogICAgeDogTWF0aC5yb3VuZCh3ICogMC4xMyksIC8vIGJvdHRvbS1sZWZ0IHRodW1ic3RpY2ssIGFzIGEgZnJhY3Rpb24gb2YgdGhlIHNjcmVlbgogICAgeTogTWF0aC5yb3VuZChoICogMC44KSwKICAgIHI6IE1hdGgucm91bmQoTWF0aC5taW4odywgaCkgKiAwLjE0KSwgLy8gZnVsbCBzcGVlZCBhdCB0aGlzIGRyYWcgZGlzdGFuY2UKICAgIHcsCiAgICBoLAogIH07Cn0KCmZ1bmN0aW9uIGNtZChjKSB7CiAgbGFzdENvbW1hbmQgPSBjOwogIHRyeSB7CiAgICBzaC5zdGRpbi53cml0ZShjICsgJ1xuJyk7CiAgfSBjYXRjaCAoZSkgewogICAgbGFzdEVycm9yID0gJ2FkYiBzdGRpbiBjbG9zZWQ6ICcgKyBTdHJpbmcoZS5tZXNzYWdlKS5zbGljZSgwLCA4MCk7CiAgfQp9Cgpjb25zdCBoZWxkID0gT2JqZWN0LmNyZWF0ZShudWxsKTsKbGV0IHRvdWNoaW5nID0gZmFsc2U7CgpmdW5jdGlvbiB1cGRhdGUoKSB7CiAgY29uc3QgYSA9IGFuY2hvcigpOwogIGNvbnN0IGR4ID0gKGhlbGQuZCA/IDEgOiAwKSAtIChoZWxkLmEgPyAxIDogMCk7CiAgY29uc3QgZHkgPSAoaGVsZC5zID8gMSA6IDApIC0gKGhlbGQudyA/IDEgOiAwKTsKICBpZiAoZHggfHwgZHkpIHsKICAgIGNvbnN0IGxlbiA9IE1hdGguaHlwb3QoZHgsIGR5KTsKICAgIGNvbnN0IHggPSBNYXRoLnJvdW5kKGEueCArIChkeCAvIGxlbikgKiBhLnIpOwogICAgY29uc3QgeSA9IE1hdGgucm91bmQoYS55ICsgKGR5IC8gbGVuKSAqIGEucik7CiAgICBpZiAoIXRvdWNoaW5nKSB7CiAgICAgIGNtZCgnaW5wdXQgbW90aW9uZXZlbnQgRE9XTiAnICsgYS54ICsgJyAnICsgYS55KTsKICAgICAgdG91Y2hpbmcgPSB0cnVlOwogICAgfQogICAgY21kKCdpbnB1dCBtb3Rpb25ldmVudCBNT1ZFICcgKyB4ICsgJyAnICsgeSk7CiAgfSBlbHNlIGlmICh0b3VjaGluZykgewogICAgY21kKCdpbnB1dCBtb3Rpb25ldmVudCBNT1ZFICcgKyBhLnggKyAnICcgKyBhLnkpOwogICAgY21kKCdpbnB1dCBtb3Rpb25ldmVudCBVUCAnICsgYS54ICsgJyAnICsgYS55KTsKICAgIHRvdWNoaW5nID0gZmFsc2U7CiAgfQp9CgpodHRwCiAgLmNyZWF0ZVNlcnZlcigocmVxLCByZXMpID0+IHsKICAgIHJlcy5zZXRIZWFkZXIoJ0FjY2Vzcy1Db250cm9sLUFsbG93LU9yaWdpbicsICcqJyk7CiAgICByZXMuc2V0SGVhZGVyKCdDYWNoZS1Db250cm9sJywgJ25vLXN0b3JlJyk7CiAgICBjb25zdCB1ID0gbmV3IFVSTChyZXEudXJsLCAnaHR0cDovL2xvY2FsaG9zdCcpOwogICAgaWYgKHUucGF0aG5hbWUgPT09ICcvaycpIHsKICAgICAgY29uc3QgayA9ICh1LnNlYXJjaFBhcmFtcy5nZXQoJ2tleScpIHx8ICcnKS50b0xvd2VyQ2FzZSgpOwogICAgICBjb25zdCBkb3duID0gdS5zZWFyY2hQYXJhbXMuZ2V0KCdkb3duJykgPT09ICcxJzsKICAgICAgaWYgKGsubGVuZ3RoID09PSAxICYmICd3YXNkJy5pbmRleE9mKGspICE9PSAtMSkgewogICAgICAgIGlmIChkb3duKSBoZWxkW2tdID0gMTsKICAgICAgICBlbHNlIGRlbGV0ZSBoZWxkW2tdOwogICAgICAgIHVwZGF0ZSgpOwogICAgICB9CiAgICB9CiAgICBpZiAodS5wYXRobmFtZSA9PT0gJy9zdGF0ZScpIHsKICAgICAgLy8gT3BlbiB0aGlzIGluIGEgdGFiIGlmIFdBU0Qgc3RvcHMgd29ya2luZzogaXQgc2F5cyB3aGF0IHdhcyBzZW50IGFuZCB3aHkuCiAgICAgIHJlcy5zZXRIZWFkZXIoJ0NvbnRlbnQtVHlwZScsICdhcHBsaWNhdGlvbi9qc29uJyk7CiAgICAgIHJlcy5lbmQoCiAgICAgICAgSlNPTi5zdHJpbmdpZnkoewogICAgICAgICAgcm90YXRpb24sCiAgICAgICAgICBzY3JlZW46IHNjcmVlbigpLAogICAgICAgICAgYW5jaG9yOiBhbmNob3IoKSwKICAgICAgICAgIGhlbGQ6IE9iamVjdC5rZXlzKGhlbGQpLAogICAgICAgICAgdG91Y2hpbmcsCiAgICAgICAgICBsYXN0Q29tbWFuZCwKICAgICAgICAgIGxhc3RFcnJvciwKICAgICAgICB9KSwKICAgICAgKTsKICAgICAgcmV0dXJuOwogICAgfQogICAgcmVzLmVuZCgnb2snKTsKICB9KQogIC5saXN0ZW4oODAwMSwgKCkgPT4gY29uc29sZS5sb2coJ2tleWQgbGlzdGVuaW5nIG9uIDgwMDEnKSk7Cg==' | base64 -d > /tmp/keyd.js
+          echo 'Ly8gSW5qZWN0ZWQgaW50byB0aGUgd3Mtc2NyY3B5IHBhZ2UgYnkgdGhlIHdvcmtmbG93LgovLwovLyBEb2VzIHR3byB0aGluZ3M6Ci8vICAgMS4gb3BlbnMgdGhlIHN0cmVhbSBpdHNlbGYsIHByZWZlcnJpbmcgdGhlIFdlYkNvZGVjcyBwbGF5ZXIgKGhhcmR3YXJlCi8vICAgICAgZGVjb2RlIGluIENocm9tZSA9IHRoZSBsb3dlc3QtZGVsYXkgcGF0aCkgYW5kIGZhbGxpbmcgYmFjayB0byBIMjY0OwovLyAgIDIuIGZvcndhcmRzIFdBU0QgLyBhcnJvd3MgdG8gdGhlIGtleSBicmlkZ2UsIHdoaWNoIGRyYWdzIFJvYmxveCdzIHN0aWNrLgovLwovLyB3aW5kb3cuX19LRVlVUkwgaXMgcHJlcGVuZGVkIGJ5IHRoZSB3b3JrZmxvdyAodGhpcyBydW4ncyBrZXkgdHVubmVsIG9yaWdpbikuCihmdW5jdGlvbiAoKSB7CiAgdmFyIGJhc2UgPSB3aW5kb3cuX19LRVlVUkwgfHwgJyc7CgogIC8vIC0tLS0gMS4gYXV0by1vcGVuIHRoZSBzdHJlYW0gLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogIHZhciBvcGVuZWQgPSBmYWxzZTsKICBmdW5jdGlvbiBhdXRvT3BlbigpIHsKICAgIGlmIChvcGVuZWQgfHwgKGxvY2F0aW9uLmhhc2ggJiYgbG9jYXRpb24uaGFzaC5pbmRleE9mKCdhY3Rpb249c3RyZWFtJykgIT09IC0xKSkgcmV0dXJuOwogICAgdmFyIGxpbmtzID0gZG9jdW1lbnQucXVlcnlTZWxlY3RvckFsbCgnYVtocmVmKj0iYWN0aW9uPXN0cmVhbSJdJyk7CiAgICBpZiAoIWxpbmtzLmxlbmd0aCkgcmV0dXJuOwogICAgdmFyIHdhbnQgPSB0eXBlb2Ygd2luZG93LlZpZGVvRGVjb2RlciA9PT0gJ2Z1bmN0aW9uJyA/ICdwbGF5ZXI9d2ViY29kZWNzJyA6ICdwbGF5ZXI9bXNlJzsKICAgIGZvciAodmFyIGkgPSAwOyBpIDwgbGlua3MubGVuZ3RoOyBpKyspIHsKICAgICAgaWYgKGxpbmtzW2ldLmhyZWYuaW5kZXhPZih3YW50KSAhPT0gLTEpIHsKICAgICAgICBvcGVuZWQgPSB0cnVlOwogICAgICAgIGxvY2F0aW9uLmhyZWYgPSBsaW5rc1tpXS5ocmVmOwogICAgICAgIHJldHVybjsKICAgICAgfQogICAgfQogIH0KICBzZXRJbnRlcnZhbChhdXRvT3BlbiwgMjAwMCk7CgogIC8vIC0tLS0gMi4gV0FTRCAtPiB0aHVtYnN0aWNrIC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLQogIGlmICghYmFzZSkgcmV0dXJuOwogIHZhciBtYXAgPSB7CiAgICBLZXlXOiAndycsCiAgICBLZXlBOiAnYScsCiAgICBLZXlTOiAncycsCiAgICBLZXlEOiAnZCcsCiAgICBBcnJvd1VwOiAndycsCiAgICBBcnJvd0xlZnQ6ICdhJywKICAgIEFycm93RG93bjogJ3MnLAogICAgQXJyb3dSaWdodDogJ2QnLAogIH07CiAgdmFyIGhlbGQgPSBPYmplY3QuY3JlYXRlKG51bGwpOwogIGZ1bmN0aW9uIHNlbmQoaywgZG93bikgewogICAgdHJ5IHsKICAgICAgZmV0Y2goYmFzZSArICcvaz9rZXk9JyArIGsgKyAnJmRvd249JyArIChkb3duID8gMSA6IDApLCB7CiAgICAgICAgbW9kZTogJ25vLWNvcnMnLAogICAgICAgIGtlZXBhbGl2ZTogdHJ1ZSwKICAgICAgfSk7CiAgICB9IGNhdGNoIChlKSB7fQogIH0KICBmdW5jdGlvbiB0eXBpbmcodCkgewogICAgaWYgKCF0IHx8ICF0LnRhZ05hbWUpIHJldHVybiBmYWxzZTsKICAgIHZhciBuID0gdC50YWdOYW1lLnRvTG93ZXJDYXNlKCk7CiAgICBpZiAobiA9PT0gJ2lucHV0JyB8fCBuID09PSAndGV4dGFyZWEnIHx8IG4gPT09ICdzZWxlY3QnIHx8IHQuaXNDb250ZW50RWRpdGFibGUpIHJldHVybiB0cnVlOwogICAgcmV0dXJuICEhKHQuY2xvc2VzdCAmJiB0LmNsb3Nlc3QoJy54dGVybScpKTsKICB9CiAgd2luZG93LmFkZEV2ZW50TGlzdGVuZXIoCiAgICAna2V5ZG93bicsCiAgICBmdW5jdGlvbiAoZSkgewogICAgICB2YXIgayA9IG1hcFtlLmNvZGVdOwogICAgICBpZiAoIWsgfHwgdHlwaW5nKGUudGFyZ2V0KSkgcmV0dXJuOwogICAgICBlLnByZXZlbnREZWZhdWx0KCk7CiAgICAgIGlmICghaGVsZFtrXSkgewogICAgICAgIGhlbGRba10gPSAxOwogICAgICAgIHNlbmQoaywgMSk7CiAgICAgIH0KICAgIH0sCiAgICB0cnVlLAogICk7CiAgd2luZG93LmFkZEV2ZW50TGlzdGVuZXIoCiAgICAna2V5dXAnLAogICAgZnVuY3Rpb24gKGUpIHsKICAgICAgdmFyIGsgPSBtYXBbZS5jb2RlXTsKICAgICAgaWYgKCFrKSByZXR1cm47CiAgICAgIGlmIChoZWxkW2tdKSB7CiAgICAgICAgZGVsZXRlIGhlbGRba107CiAgICAgICAgc2VuZChrLCAwKTsKICAgICAgfQogICAgfSwKICAgIHRydWUsCiAgKTsKICB3aW5kb3cuYWRkRXZlbnRMaXN0ZW5lcignYmx1cicsIGZ1bmN0aW9uICgpIHsKICAgIE9iamVjdC5rZXlzKGhlbGQpLmZvckVhY2goZnVuY3Rpb24gKGspIHsKICAgICAgZGVsZXRlIGhlbGRba107CiAgICAgIHNlbmQoaywgMCk7CiAgICB9KTsKICB9KTsKfSkoKTsK' | base64 -d > /tmp/keys.body.js
 
           set -x
           cd client/dist && nohup node index.js > /tmp/ws.log 2>&1 &
-          DEV_W=432 DEV_H=768 nohup node /tmp/keyd.js > /tmp/keyd.log 2>&1 &
+          DEV_W=640 DEV_H=360 nohup node /tmp/keyd.js > /tmp/keyd.log 2>&1 &
           sleep 5
 
           curl -fL -o cloudflared \
@@ -250,7 +263,12 @@ jobs:
           else
             echo "PAGE MISSING - WASD script not installed"
           fi
-          [ -n "$KURL" ] && echo "WASD bridge ready" || echo "WASD bridge OFF - no key tunnel"
+          if [ -n "$KURL" ]; then
+            echo "WASD bridge ready"
+            echo "KEY DEBUG (only if WASD does nothing): $KURL/state"
+          else
+            echo "WASD bridge OFF - no key tunnel"
+          fi
 
           echo "=============================================="
           echo "$URL"
